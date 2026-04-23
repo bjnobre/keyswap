@@ -1,0 +1,35 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+  configure)
+    if ! getent group uinput >/dev/null 2>&1; then
+      addgroup --system uinput || true
+    fi
+
+    udevadm control --reload-rules || true
+    udevadm trigger --subsystem-match=input || true
+    modprobe uinput || true
+
+    cat <<'EOF'
+keyswap installed.
+
+Next steps for the target desktop user:
+
+  1. Add the user to the required groups:
+     sudo usermod -aG input,uinput <username>
+
+  2. Log out and log back in.
+
+  3. Create or edit:
+     ~/.config/keyswap/config.json
+
+  4. Enable the user service:
+     systemctl --user daemon-reload
+     systemctl --user enable --now keyswap.service
+EOF
+    ;;
+esac
+
+#DEBHELPER#
+exit 0

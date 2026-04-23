@@ -1,0 +1,37 @@
+keyswap for Debian
+==================
+
+keyswap installs:
+
+- the executable Python daemon
+- a fallback configuration in /etc/keyswap/config.json
+- a systemd user unit: keyswap.service
+- a udev rule for input access
+
+Configuration precedence
+------------------------
+
+1. --config /path/to/config.json
+2. ~/.config/keyswap/config.json
+3. /etc/keyswap/config.json
+
+First-time setup
+----------------
+
+If your user was not already in the required groups, add it and then log out and back in:
+
+    sudo usermod -aG input,uinput "$USER"
+
+Create your personal config:
+
+    mkdir -p ~/.config/keyswap
+    cp /etc/keyswap/config.json ~/.config/keyswap/config.json
+
+Enable the user service:
+
+    systemctl --user daemon-reload
+    systemctl --user enable --now keyswap.service
+
+Check logs:
+
+    journalctl --user -u keyswap.service -f

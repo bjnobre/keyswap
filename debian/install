@@ -1,0 +1,4 @@
+keyswap.py usr/lib/keyswap/
+config/config.json etc/keyswap/
+systemd/user/keyswap.service usr/lib/systemd/user/
+udev/70-keyswap.rules lib/udev/rules.d/
