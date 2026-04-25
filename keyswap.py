@@ -284,7 +284,7 @@ def resolve_user_config_path() -> Path:
 
 def setup_logging(verbose_stdout: bool):
     handlers = [logging.StreamHandler(sys.stdout)]
-    level = logging.DEBUG if verbose_stdout else logging.INFO
+    level = logging.DEBUG if verbose_stdout else logging.WARNING
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -731,18 +731,61 @@ def main():
     log.info("watching substitutions: %s", [v["combo_text"] for v in substitutions.values()])
     log.info("watching sequences: %s", list(sequences.keys()))
 
-    devices = [InputDevice(path) for path in dev_paths]
-    for dev in devices:
-        log.info("opening device path=%s name=%s", dev.path, dev.name)
+
+
+
+    devices = []
+    failed_devices = []
+
+    for path in dev_paths:
+        try:
+            dev = InputDevice(path)
+            devices.append(dev)
+            log.info("opening device path=%s name=%s", dev.path, dev.name)
+        except FileNotFoundError:
+            failed_devices.append((path, "not found"))
+            log.warning("configured device is missing: %s", path)
+        except PermissionError:
+            failed_devices.append((path, "permission denied"))
+            log.warning("configured device is not accessible: %s", path)
+        except OSError as e:
+            failed_devices.append((path, str(e)))
+            log.warning("failed to open configured device %s: %s", path, e)
+
+    if not devices:
+        raise RuntimeError(
+            "no configured input devices could be opened: "
+            + ", ".join(f"{path} ({reason})" for path, reason in failed_devices)
+        )
+
+    if failed_devices:
+        log.warning(
+            "some configured devices are unavailable at startup: %s",
+            ", ".join(f"{path} ({reason})" for path, reason in failed_devices),
+        )
 
     ui = UInput.from_device(*devices, name="keyswap-uinput")
 
     signal.signal(signal.SIGINT, cleanup_and_exit)
     signal.signal(signal.SIGTERM, cleanup_and_exit)
 
+    still_open_devices = []
     for dev in devices:
-        dev.grab()
-        log.info("grabbed device path=%s name=%s", dev.path, dev.name)
+        try:
+            dev.grab()
+            log.info("grabbed device path=%s name=%s", dev.path, dev.name)
+            still_open_devices.append(dev)
+        except OSError as e:
+            log.warning("failed to grab device path=%s name=%s: %s", dev.path, dev.name, e)
+            try:
+                dev.close()
+            except Exception:
+                pass
+
+    devices = still_open_devices
+
+    if not devices:
+        raise RuntimeError("configured input devices were opened, but none could be grabbed")
 
     poller = select.poll()
     fd_to_dev = {}
@@ -755,10 +798,37 @@ def main():
         ready = poller.poll()
 
         for fd, mask in ready:
+            if mask & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                dev = fd_to_dev.pop(fd, None)
+                try:
+                    poller.unregister(fd)
+                except Exception:
+                    pass
+
+                if dev is not None:
+                    log.warning(
+                        "device fd=%s path=%s name=%s became invalid (mask=%s); removing from poll set",
+                        fd,
+                        getattr(dev, "path", "?"),
+                        getattr(dev, "name", "?"),
+                        mask,
+                    )
+                    try:
+                        dev.ungrab()
+                    except Exception:
+                        pass
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+                continue
+
             if not (mask & select.POLLIN):
                 continue
 
-            dev = fd_to_dev[fd]
+            dev = fd_to_dev.get(fd)
+            if dev is None:
+                continue
 
             try:
                 for event in dev.read():
@@ -770,11 +840,35 @@ def main():
 
             except BlockingIOError:
                 continue
+            except OSError as e:
+                log.warning(
+                    "device read failed fd=%s path=%s name=%s: %s; removing from poll set",
+                    fd,
+                    getattr(dev, "path", "?"),
+                    getattr(dev, "name", "?"),
+                    e,
+                )
+                try:
+                    poller.unregister(fd)
+                except Exception:
+                    pass
+                fd_to_dev.pop(fd, None)
+                try:
+                    dev.ungrab()
+                except Exception:
+                    pass
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+
+
+        if not fd_to_dev:
+            log.error("no input devices remain in poll set; exiting")
+            break
 
         if should_run_queued_sequence_now():
-            more_ready = poller.poll(0)
-            if not more_ready:
-                run_queued_sequence_if_any()
+            run_queued_sequence_if_any()
 
 
 if __name__ == "__main__":
