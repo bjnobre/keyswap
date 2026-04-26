@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+"""
+keyswap: low-level keyboard combo substitution and text expansion daemon.
+
+What it does:
+- Watches one or more input devices through evdev
+- Re-emits events through a uinput virtual device
+- Supports combo substitutions (e.g. C-nk_minus -> "=")
+- Supports sequence expansions (e.g. ":123" -> "1234567890")
+- Decodes typed characters through xkbcommon so layout-dependent text works better
+
+Notes:
+- This daemon expects real keyboard devices in the config
+- Removable devices may disappear and reappear with different /dev/input/eventN numbers
+- Prefer stable paths like /dev/input/by-path/... or custom udev symlinks when possible
+"""
+
+from __future__ import annotations
 
 import argparse
 import ctypes
@@ -10,25 +27,37 @@ import signal
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from evdev import InputDevice, UInput, ecodes
 
+# -----------------------------------------------------------------------------
+# Configuration and constants
+# -----------------------------------------------------------------------------
+
 SYSTEM_CONFIG_PATH = Path("/etc/keyswap/config.json")
 
-pending_sequence_run = None
-
+# Timing controls for sequence expansion.
 SEQUENCE_BACKSPACE_SETTLE_MS = 20
 TYPE_CHAR_DELAY_MS = 20
+BACKSPACE_DELAY_MS = 2
 
-MODIFIERS = {
+# XKB constants.
+XKB_CONTEXT_NO_FLAGS = 0
+XKB_KEYMAP_COMPILE_NO_FLAGS = 0
+XKB_KEY_DOWN = 1
+XKB_KEY_UP = 0
+
+# Modifier aliases used in combo config strings.
+MODIFIER_KEYCODES = {
     "C": {ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL},
     "A": {ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT},
     "S": {ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT},
     "M": {ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA},
 }
+ALL_MODIFIER_KEYS = set().union(*MODIFIER_KEYCODES.values())
 
-ALL_MODIFIER_KEYS = set().union(*MODIFIERS.values())
-
+# Supported key names in config strings.
 KEY_ALIASES = {
     "nk_minus": ecodes.KEY_KPMINUS,
     "nk_delete": ecodes.KEY_KPDOT,
@@ -63,32 +92,72 @@ KEY_ALIASES = {
     "backspace": ecodes.KEY_BACKSPACE,
 }
 
+# Characters the daemon can synthesize through uinput.
+# This is separate from XKB decoding: XKB is used to understand what the user
+# typed; this map is used to emit replacement text.
 CHARMAP = {
-    "a": (ecodes.KEY_A, False), "b": (ecodes.KEY_B, False), "c": (ecodes.KEY_C, False),
-    "d": (ecodes.KEY_D, False), "e": (ecodes.KEY_E, False), "f": (ecodes.KEY_F, False),
-    "g": (ecodes.KEY_G, False), "h": (ecodes.KEY_H, False), "i": (ecodes.KEY_I, False),
-    "j": (ecodes.KEY_J, False), "k": (ecodes.KEY_K, False), "l": (ecodes.KEY_L, False),
-    "m": (ecodes.KEY_M, False), "n": (ecodes.KEY_N, False), "o": (ecodes.KEY_O, False),
-    "p": (ecodes.KEY_P, False), "q": (ecodes.KEY_Q, False), "r": (ecodes.KEY_R, False),
-    "s": (ecodes.KEY_S, False), "t": (ecodes.KEY_T, False), "u": (ecodes.KEY_U, False),
-    "v": (ecodes.KEY_V, False), "w": (ecodes.KEY_W, False), "x": (ecodes.KEY_X, False),
-    "y": (ecodes.KEY_Y, False), "z": (ecodes.KEY_Z, False),
-
-    "A": (ecodes.KEY_A, True), "B": (ecodes.KEY_B, True), "C": (ecodes.KEY_C, True),
-    "D": (ecodes.KEY_D, True), "E": (ecodes.KEY_E, True), "F": (ecodes.KEY_F, True),
-    "G": (ecodes.KEY_G, True), "H": (ecodes.KEY_H, True), "I": (ecodes.KEY_I, True),
-    "J": (ecodes.KEY_J, True), "K": (ecodes.KEY_K, True), "L": (ecodes.KEY_L, True),
-    "M": (ecodes.KEY_M, True), "N": (ecodes.KEY_N, True), "O": (ecodes.KEY_O, True),
-    "P": (ecodes.KEY_P, True), "Q": (ecodes.KEY_Q, True), "R": (ecodes.KEY_R, True),
-    "S": (ecodes.KEY_S, True), "T": (ecodes.KEY_T, True), "U": (ecodes.KEY_U, True),
-    "V": (ecodes.KEY_V, True), "W": (ecodes.KEY_W, True), "X": (ecodes.KEY_X, True),
-    "Y": (ecodes.KEY_Y, True), "Z": (ecodes.KEY_Z, True),
-
-    "0": (ecodes.KEY_0, False), "1": (ecodes.KEY_1, False), "2": (ecodes.KEY_2, False),
-    "3": (ecodes.KEY_3, False), "4": (ecodes.KEY_4, False), "5": (ecodes.KEY_5, False),
-    "6": (ecodes.KEY_6, False), "7": (ecodes.KEY_7, False), "8": (ecodes.KEY_8, False),
+    "a": (ecodes.KEY_A, False),
+    "b": (ecodes.KEY_B, False),
+    "c": (ecodes.KEY_C, False),
+    "d": (ecodes.KEY_D, False),
+    "e": (ecodes.KEY_E, False),
+    "f": (ecodes.KEY_F, False),
+    "g": (ecodes.KEY_G, False),
+    "h": (ecodes.KEY_H, False),
+    "i": (ecodes.KEY_I, False),
+    "j": (ecodes.KEY_J, False),
+    "k": (ecodes.KEY_K, False),
+    "l": (ecodes.KEY_L, False),
+    "m": (ecodes.KEY_M, False),
+    "n": (ecodes.KEY_N, False),
+    "o": (ecodes.KEY_O, False),
+    "p": (ecodes.KEY_P, False),
+    "q": (ecodes.KEY_Q, False),
+    "r": (ecodes.KEY_R, False),
+    "s": (ecodes.KEY_S, False),
+    "t": (ecodes.KEY_T, False),
+    "u": (ecodes.KEY_U, False),
+    "v": (ecodes.KEY_V, False),
+    "w": (ecodes.KEY_W, False),
+    "x": (ecodes.KEY_X, False),
+    "y": (ecodes.KEY_Y, False),
+    "z": (ecodes.KEY_Z, False),
+    "A": (ecodes.KEY_A, True),
+    "B": (ecodes.KEY_B, True),
+    "C": (ecodes.KEY_C, True),
+    "D": (ecodes.KEY_D, True),
+    "E": (ecodes.KEY_E, True),
+    "F": (ecodes.KEY_F, True),
+    "G": (ecodes.KEY_G, True),
+    "H": (ecodes.KEY_H, True),
+    "I": (ecodes.KEY_I, True),
+    "J": (ecodes.KEY_J, True),
+    "K": (ecodes.KEY_K, True),
+    "L": (ecodes.KEY_L, True),
+    "M": (ecodes.KEY_M, True),
+    "N": (ecodes.KEY_N, True),
+    "O": (ecodes.KEY_O, True),
+    "P": (ecodes.KEY_P, True),
+    "Q": (ecodes.KEY_Q, True),
+    "R": (ecodes.KEY_R, True),
+    "S": (ecodes.KEY_S, True),
+    "T": (ecodes.KEY_T, True),
+    "U": (ecodes.KEY_U, True),
+    "V": (ecodes.KEY_V, True),
+    "W": (ecodes.KEY_W, True),
+    "X": (ecodes.KEY_X, True),
+    "Y": (ecodes.KEY_Y, True),
+    "Z": (ecodes.KEY_Z, True),
+    "0": (ecodes.KEY_0, False),
+    "1": (ecodes.KEY_1, False),
+    "2": (ecodes.KEY_2, False),
+    "3": (ecodes.KEY_3, False),
+    "4": (ecodes.KEY_4, False),
+    "5": (ecodes.KEY_5, False),
+    "6": (ecodes.KEY_6, False),
+    "7": (ecodes.KEY_7, False),
+    "8": (ecodes.KEY_8, False),
     "9": (ecodes.KEY_9, False),
-
     "=": (ecodes.KEY_EQUAL, False),
     "+": (ecodes.KEY_EQUAL, True),
     "-": (ecodes.KEY_MINUS, False),
@@ -125,20 +194,30 @@ CHARMAP = {
     ")": (ecodes.KEY_0, True),
 }
 
-pressed_physical = set()
-forwarded_modifiers = set()
-suppressed_keyups = set()
-triggered_keys = set()
+# -----------------------------------------------------------------------------
+# Runtime mutable state
+# -----------------------------------------------------------------------------
+
+pressed_physical_keys: set[int] = set()
+forwarded_modifier_keys: set[int] = set()
+suppressed_keyup_codes: set[int] = set()
+triggered_combo_keys: set[int] = set()
 
 typed_buffer = ""
 max_sequence_len = 0
-pending_sequence_match = None
 
-devices = []
-ui = None
-log = None
-xkb_decoder = None
+pending_sequence_match: dict[str, Any] | None = None
+pending_sequence_run: dict[str, Any] | None = None
 
+open_devices: list[InputDevice] = []
+virtual_uinput: UInput | None = None
+logger: logging.Logger | None = None
+xkb_decoder: "XKBDecoder | None" = None
+
+
+# -----------------------------------------------------------------------------
+# XKB bindings
+# -----------------------------------------------------------------------------
 
 class XKBRuleNames(ctypes.Structure):
     _fields_ = [
@@ -151,20 +230,56 @@ class XKBRuleNames(ctypes.Structure):
 
 
 class XKBDecoder:
-    XKB_CONTEXT_NO_FLAGS = 0
-    XKB_KEYMAP_COMPILE_NO_FLAGS = 0
-    XKB_KEY_DOWN = 1
-    XKB_KEY_UP = 0
+    """Minimal xkbcommon wrapper for decoding typed characters."""
 
-    def __init__(self, cfg: dict | None = None):
+    def __init__(self, cfg: dict[str, Any] | None = None):
         cfg = cfg or {}
         try:
             self.lib = ctypes.cdll.LoadLibrary("libxkbcommon.so.0")
         except OSError as exc:
-            raise RuntimeError(
-                "libxkbcommon.so.0 not found. Install libxkbcommon0."
-            ) from exc
+            raise RuntimeError("libxkbcommon.so.0 not found. Install libxkbcommon0.") from exc
 
+        self._setup_signatures()
+
+        self.context = self.lib.xkb_context_new(XKB_CONTEXT_NO_FLAGS)
+        if not self.context:
+            raise RuntimeError("failed to create xkb context")
+
+        names = XKBRuleNames(
+            self._encode(cfg.get("rules") or os.environ.get("XKB_DEFAULT_RULES")),
+            self._encode(cfg.get("model") or os.environ.get("XKB_DEFAULT_MODEL")),
+            self._encode(cfg.get("layout") or os.environ.get("XKB_DEFAULT_LAYOUT") or "us"),
+            self._encode(cfg.get("variant") or os.environ.get("XKB_DEFAULT_VARIANT")),
+            self._encode(cfg.get("options") or os.environ.get("XKB_DEFAULT_OPTIONS")),
+        )
+
+        self.keymap = self.lib.xkb_keymap_new_from_names(
+            self.context,
+            ctypes.byref(names),
+            XKB_KEYMAP_COMPILE_NO_FLAGS,
+        )
+        if not self.keymap:
+            self.lib.xkb_context_unref(self.context)
+            raise RuntimeError(
+                "failed to create xkb keymap for "
+                f"layout={cfg.get('layout') or os.environ.get('XKB_DEFAULT_LAYOUT') or 'us'}"
+            )
+
+        self.state = self.lib.xkb_state_new(self.keymap)
+        if not self.state:
+            self.lib.xkb_keymap_unref(self.keymap)
+            self.lib.xkb_context_unref(self.context)
+            raise RuntimeError("failed to create xkb state")
+
+        self.layout_info = {
+            "rules": cfg.get("rules") or os.environ.get("XKB_DEFAULT_RULES"),
+            "model": cfg.get("model") or os.environ.get("XKB_DEFAULT_MODEL"),
+            "layout": cfg.get("layout") or os.environ.get("XKB_DEFAULT_LAYOUT") or "us",
+            "variant": cfg.get("variant") or os.environ.get("XKB_DEFAULT_VARIANT"),
+            "options": cfg.get("options") or os.environ.get("XKB_DEFAULT_OPTIONS"),
+        }
+
+    def _setup_signatures(self) -> None:
         self.lib.xkb_context_new.argtypes = [ctypes.c_int]
         self.lib.xkb_context_new.restype = ctypes.c_void_p
 
@@ -198,58 +313,19 @@ class XKBDecoder:
         ]
         self.lib.xkb_state_key_get_utf8.restype = ctypes.c_int
 
-        self.context = self.lib.xkb_context_new(self.XKB_CONTEXT_NO_FLAGS)
-        if not self.context:
-            raise RuntimeError("failed to create xkb context")
-
-        names = XKBRuleNames(
-            self._enc(cfg.get("rules") or os.environ.get("XKB_DEFAULT_RULES")),
-            self._enc(cfg.get("model") or os.environ.get("XKB_DEFAULT_MODEL")),
-            self._enc(cfg.get("layout") or os.environ.get("XKB_DEFAULT_LAYOUT") or "us"),
-            self._enc(cfg.get("variant") or os.environ.get("XKB_DEFAULT_VARIANT")),
-            self._enc(cfg.get("options") or os.environ.get("XKB_DEFAULT_OPTIONS")),
-        )
-
-        self.keymap = self.lib.xkb_keymap_new_from_names(
-            self.context,
-            ctypes.byref(names),
-            self.XKB_KEYMAP_COMPILE_NO_FLAGS,
-        )
-        if not self.keymap:
-            self.lib.xkb_context_unref(self.context)
-            raise RuntimeError(
-                f"failed to create xkb keymap for layout={cfg.get('layout') or os.environ.get('XKB_DEFAULT_LAYOUT') or 'us'}"
-            )
-
-        self.state = self.lib.xkb_state_new(self.keymap)
-        if not self.state:
-            self.lib.xkb_keymap_unref(self.keymap)
-            self.lib.xkb_context_unref(self.context)
-            raise RuntimeError("failed to create xkb state")
-
-        self.layout_info = {
-            "rules": cfg.get("rules") or os.environ.get("XKB_DEFAULT_RULES"),
-            "model": cfg.get("model") or os.environ.get("XKB_DEFAULT_MODEL"),
-            "layout": cfg.get("layout") or os.environ.get("XKB_DEFAULT_LAYOUT") or "us",
-            "variant": cfg.get("variant") or os.environ.get("XKB_DEFAULT_VARIANT"),
-            "options": cfg.get("options") or os.environ.get("XKB_DEFAULT_OPTIONS"),
-        }
-
     @staticmethod
-    def _enc(value):
-        if value is None:
-            return None
-        return value.encode("utf-8")
+    def _encode(value: str | None) -> bytes | None:
+        return None if value is None else value.encode("utf-8")
 
     @staticmethod
     def _to_xkb_keycode(evdev_keycode: int) -> int:
         return evdev_keycode + 8
 
-    def update_key(self, evdev_keycode: int, is_down: bool):
+    def update_key(self, evdev_keycode: int, is_down: bool) -> None:
         self.lib.xkb_state_update_key(
             self.state,
             self._to_xkb_keycode(evdev_keycode),
-            self.XKB_KEY_DOWN if is_down else self.XKB_KEY_UP,
+            XKB_KEY_DOWN if is_down else XKB_KEY_UP,
         )
 
     def char_for_keydown(self, evdev_keycode: int) -> str | None:
@@ -259,11 +335,9 @@ class XKBDecoder:
         if n <= 0:
             return None
         text = buf.value.decode("utf-8", errors="ignore")
-        if not text:
-            return None
-        return text
+        return text or None
 
-    def close(self):
+    def close(self) -> None:
         if getattr(self, "state", None):
             self.lib.xkb_state_unref(self.state)
             self.state = None
@@ -275,16 +349,20 @@ class XKBDecoder:
             self.context = None
 
 
+# -----------------------------------------------------------------------------
+# Logging and config loading
+# -----------------------------------------------------------------------------
+
 def resolve_user_config_path() -> Path:
-    xdg = os.environ.get("XDG_CONFIG_HOME")
-    if xdg:
-        return Path(xdg).expanduser() / "keyswap" / "config.json"
+    xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+    if xdg_config_home:
+        return Path(xdg_config_home).expanduser() / "keyswap" / "config.json"
     return Path.home() / ".config" / "keyswap" / "config.json"
 
 
-def setup_logging(verbose_stdout: bool):
+def setup_logging(verbose: bool) -> logging.Logger:
     handlers = [logging.StreamHandler(sys.stdout)]
-    level = logging.DEBUG if verbose_stdout else logging.WARNING
+    level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -293,15 +371,7 @@ def setup_logging(verbose_stdout: bool):
     return logging.getLogger("keyswap")
 
 
-def key_name(code: int) -> str:
-    return ecodes.KEY.get(code, f"UNKNOWN_{code}")
-
-
-def value_name(value: int) -> str:
-    return {0: "up", 1: "down", 2: "repeat"}.get(value, str(value))
-
-
-def get_paths():
+def parse_args() -> tuple[Path, bool, bool]:
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--config", help="Explicit config path")
     parser.add_argument("--verbose", action="store_true")
@@ -311,27 +381,14 @@ def get_paths():
     if args.config:
         return Path(args.config).expanduser().resolve(), args.verbose, args.dump_config
 
-    user_cfg = resolve_user_config_path()
-    if user_cfg.is_file():
-        return user_cfg.resolve(), args.verbose, args.dump_config
+    user_config = resolve_user_config_path()
+    if user_config.is_file():
+        return user_config.resolve(), args.verbose, args.dump_config
 
     return SYSTEM_CONFIG_PATH, args.verbose, args.dump_config
 
 
-def parse_combo(combo: str):
-    parts = combo.split("-")
-    required_mods = set()
-
-    for p in parts[:-1]:
-        if p not in MODIFIERS:
-            raise ValueError(f"unknown modifier '{p}' in combo '{combo}'")
-        required_mods.add(p)
-
-    main_key = parse_key(parts[-1])
-    return required_mods, main_key
-
-
-def parse_key(name: str):
+def parse_key(name: str) -> int:
     lowered = name.lower()
 
     if lowered in KEY_ALIASES:
@@ -350,28 +407,40 @@ def parse_key(name: str):
     raise ValueError(f"unknown key '{name}'")
 
 
-def load_config(config_path: Path):
+def parse_combo(combo: str) -> tuple[set[str], int]:
+    parts = combo.split("-")
+    required_modifiers: set[str] = set()
+
+    for part in parts[:-1]:
+        if part not in MODIFIER_KEYCODES:
+            raise ValueError(f"unknown modifier '{part}' in combo '{combo}'")
+        required_modifiers.add(part)
+
+    return required_modifiers, parse_key(parts[-1])
+
+
+def load_config(config_path: Path) -> tuple[list[str], dict, dict, dict]:
     global max_sequence_len
 
-    with open(config_path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
+    with open(config_path, "r", encoding="utf-8") as handle:
+        raw = json.load(handle)
 
     if "substitutions" not in raw:
         raise ValueError("config must contain 'substitutions'")
 
     if "devices" in raw:
-        dev_paths = raw["devices"]
-        if not isinstance(dev_paths, list) or not dev_paths:
+        device_paths = raw["devices"]
+        if not isinstance(device_paths, list) or not device_paths:
             raise ValueError("'devices' must be a non-empty list")
     elif "device" in raw:
-        dev_paths = [raw["device"]]
+        device_paths = [raw["device"]]
     else:
         raise ValueError("config must contain 'device' or 'devices'")
 
-    compiled = {}
+    substitutions = {}
     for combo, output in raw["substitutions"].items():
-        required_mods, main_key = parse_combo(combo)
-        compiled[(frozenset(required_mods), main_key)] = {
+        required_modifiers, main_key = parse_combo(combo)
+        substitutions[(frozenset(required_modifiers), main_key)] = {
             "combo_text": combo,
             "output": output,
         }
@@ -380,84 +449,124 @@ def load_config(config_path: Path):
     if not isinstance(sequences, dict):
         raise ValueError("'sequences' must be an object/map")
 
-    xkb_cfg = raw.get("xkb", {})
-    if not isinstance(xkb_cfg, dict):
+    xkb_config = raw.get("xkb", {})
+    if not isinstance(xkb_config, dict):
         raise ValueError("'xkb' must be an object/map when present")
 
-    max_sequence_len = max((len(k) for k in sequences), default=0)
+    max_sequence_len = max((len(trigger) for trigger in sequences), default=0)
+    return device_paths, substitutions, sequences, xkb_config
 
-    return dev_paths, compiled, sequences, xkb_cfg
+
+def dump_loaded_config(
+    config_path: Path,
+    device_paths: list[str],
+    substitutions: dict,
+    sequences: dict,
+    xkb_config: dict,
+) -> None:
+    print(f"config: {config_path}")
+    print("devices:")
+    for path in device_paths:
+        print(f"  - {path}")
+
+    print("substitutions:")
+    for item in substitutions.values():
+        print(f"  - {item['combo_text']} -> {item['output']}")
+
+    print("sequences:")
+    for trigger, replacement in sequences.items():
+        print(f"  - {trigger!r} -> {replacement!r}")
+
+    print("xkb:")
+    for key in ("rules", "model", "layout", "variant", "options"):
+        if xkb_config.get(key):
+            print(f"  - {key}: {xkb_config[key]}")
 
 
-def physical_modifiers():
-    active = set()
-    for mod_name, keys in MODIFIERS.items():
-        if pressed_physical & keys:
-            active.add(mod_name)
+# -----------------------------------------------------------------------------
+# State helpers
+# -----------------------------------------------------------------------------
+
+def key_name(code: int) -> str:
+    return ecodes.KEY.get(code, f"UNKNOWN_{code}")
+
+
+def value_name(value: int) -> str:
+    return {0: "up", 1: "down", 2: "repeat"}.get(value, str(value))
+
+
+def physical_modifiers() -> set[str]:
+    active: set[str] = set()
+    for modifier_name, keycodes in MODIFIER_KEYCODES.items():
+        if pressed_physical_keys & keycodes:
+            active.add(modifier_name)
     return active
 
 
-def state_snapshot():
+def state_snapshot() -> dict[str, Any]:
     return {
-        "pressed": [key_name(k) for k in sorted(pressed_physical)],
-        "forwarded_modifiers": [key_name(k) for k in sorted(forwarded_modifiers)],
-        "suppressed_keyups": [key_name(k) for k in sorted(suppressed_keyups)],
-        "triggered_keys": [key_name(k) for k in sorted(triggered_keys)],
+        "pressed": [key_name(code) for code in sorted(pressed_physical_keys)],
+        "forwarded_modifiers": [key_name(code) for code in sorted(forwarded_modifier_keys)],
+        "suppressed_keyups": [key_name(code) for code in sorted(suppressed_keyup_codes)],
+        "triggered_keys": [key_name(code) for code in sorted(triggered_combo_keys)],
         "mods": sorted(physical_modifiers()),
         "typed_buffer": typed_buffer[-40:],
         "pending_sequence_match": pending_sequence_match,
     }
 
 
-def write_key(code: int, value: int, reason: str):
-    log.debug("emit key %-14s %-6s reason=%s", key_name(code), value_name(value), reason)
-    ui.write(ecodes.EV_KEY, code, value)
+# -----------------------------------------------------------------------------
+# Output helpers
+# -----------------------------------------------------------------------------
+
+def write_key(code: int, value: int, reason: str) -> None:
+    logger.debug("emit key %-14s %-6s reason=%s", key_name(code), value_name(value), reason)
+    virtual_uinput.write(ecodes.EV_KEY, code, value)
 
 
-def sync(reason: str):
-    log.debug("emit syn reason=%s", reason)
-    ui.syn()
+def sync(reason: str) -> None:
+    logger.debug("emit syn reason=%s", reason)
+    virtual_uinput.syn()
 
 
-def tap(code: int, reason: str):
+def tap(code: int, reason: str) -> None:
     write_key(code, 1, reason)
     write_key(code, 0, reason)
     sync(reason)
 
 
-def send_backspaces(count: int, reason: str):
+def send_backspaces(count: int, reason: str) -> None:
     for _ in range(count):
         tap(ecodes.KEY_BACKSPACE, reason)
-        time.sleep(0.002)
+        time.sleep(BACKSPACE_DELAY_MS / 1000.0)
 
 
-def release_forwarded_modifiers():
-    to_release = list(forwarded_modifiers)
+def release_forwarded_modifiers() -> None:
+    to_release = list(forwarded_modifier_keys)
     if not to_release:
         return
 
-    log.debug(
+    logger.debug(
         "release_forwarded_modifiers begin state=%s releasing=%s",
         state_snapshot(),
-        [key_name(k) for k in to_release],
+        [key_name(code) for code in to_release],
     )
 
     for code in to_release:
         write_key(code, 0, "release_forwarded_modifiers")
-        suppressed_keyups.add(code)
+        suppressed_keyup_codes.add(code)
 
     sync("release_forwarded_modifiers")
-    forwarded_modifiers.clear()
+    forwarded_modifier_keys.clear()
+    logger.debug("release_forwarded_modifiers end state=%s", state_snapshot())
 
-    log.debug("release_forwarded_modifiers end state=%s", state_snapshot())
 
-
-def type_char(ch: str):
+def type_char(ch: str) -> None:
     if ch not in CHARMAP:
         raise ValueError(f"unsupported output character: {ch!r}")
 
     keycode, needs_shift = CHARMAP[ch]
-    log.debug("type_char ch=%r key=%s needs_shift=%s", ch, key_name(keycode), needs_shift)
+    logger.debug("type_char ch=%r key=%s needs_shift=%s", ch, key_name(keycode), needs_shift)
 
     if needs_shift:
         write_key(ecodes.KEY_LEFTSHIFT, 1, f"type_char({ch}) shift_down")
@@ -470,42 +579,325 @@ def type_char(ch: str):
         sync(f"type_char({ch}) shift_up")
 
 
-def type_text(text: str):
-    log.info("typing substitution text=%r", text)
+def type_text(text: str) -> None:
+    logger.info("typing substitution text=%r", text)
     for ch in text:
         type_char(ch)
         time.sleep(TYPE_CHAR_DELAY_MS / 1000.0)
 
-def forward_event(event, reason: str, dev_name: str):
+
+def forward_event(event, reason: str, device_name: str) -> None:
     if event.type == ecodes.EV_KEY:
-        log.debug(
+        logger.debug(
             "forward key %-14s %-6s dev=%s reason=%s state=%s",
             key_name(event.code),
             value_name(event.value),
-            dev_name,
+            device_name,
             reason,
             state_snapshot(),
         )
-    ui.write_event(event)
-    ui.syn()
+    virtual_uinput.write_event(event)
+    virtual_uinput.syn()
 
 
-def cleanup_and_exit(*_args):
-    global devices, ui, xkb_decoder
-    if log is not None:
-        log.info("stopping")
+# -----------------------------------------------------------------------------
+# Sequence expansion helpers
+# -----------------------------------------------------------------------------
+
+def update_typed_buffer_from_keydown(code: int) -> None:
+    global typed_buffer
+
+    if code == ecodes.KEY_BACKSPACE:
+        typed_buffer = typed_buffer[:-1]
+        logger.info("typed_buffer=%r", typed_buffer)
+        return
+
+    if code == ecodes.KEY_TAB:
+        typed_buffer += "\t"
+        typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
+        logger.info("typed_buffer=%r", typed_buffer)
+        return
+
+    if code == ecodes.KEY_ENTER:
+        typed_buffer += "\n"
+        typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
+        logger.info("typed_buffer=%r", typed_buffer)
+        return
+
+    if code == ecodes.KEY_ESC:
+        typed_buffer = ""
+        logger.info("typed_buffer=%r", typed_buffer)
+        return
+
+    if xkb_decoder is None:
+        return
+
+    ch = xkb_decoder.char_for_keydown(code)
+    if ch:
+        typed_buffer += ch
+        typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
+        logger.info("typed_buffer=%r", typed_buffer)
+
+
+def maybe_mark_pending_sequence(sequences: dict[str, str], last_code: int) -> bool:
+    global pending_sequence_match
+
+    if pending_sequence_match is not None or not sequences or not typed_buffer:
+        return False
+
+    for trigger, replacement in sequences.items():
+        if typed_buffer.endswith(trigger):
+            pending_sequence_match = {
+                "trigger": trigger,
+                "replacement": replacement,
+                "last_code": last_code,
+            }
+            logger.info(
+                "pending sequence trigger=%r replacement=%r last_key=%s",
+                trigger,
+                replacement,
+                key_name(last_code),
+            )
+            return True
+
+    return False
+
+
+def queue_pending_sequence_if_matches(code: int) -> bool:
+    global pending_sequence_match, pending_sequence_run
+
+    if pending_sequence_match is None:
+        return False
+    if pending_sequence_match["last_code"] != code:
+        return False
+
+    pending_sequence_run = pending_sequence_match
+    pending_sequence_match = None
+
+    logger.info(
+        "queued sequence trigger=%r replacement=%r on keyup=%s",
+        pending_sequence_run["trigger"],
+        pending_sequence_run["replacement"],
+        key_name(code),
+    )
+    return True
+
+
+def run_queued_sequence_if_any() -> bool:
+    global typed_buffer, pending_sequence_run
+
+    if pending_sequence_run is None:
+        return False
+
+    trigger = pending_sequence_run["trigger"]
+    replacement = pending_sequence_run["replacement"]
+
+    logger.info("running queued sequence trigger=%r replacement=%r", trigger, replacement)
+
+    release_forwarded_modifiers()
+    send_backspaces(len(trigger), f"sequence_backspace({trigger})")
+    time.sleep(SEQUENCE_BACKSPACE_SETTLE_MS / 1000.0)
+    type_text(replacement)
+
+    typed_buffer = typed_buffer[:-len(trigger)] + replacement
+    typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
+    logger.info("typed_buffer=%r", typed_buffer)
+
+    pending_sequence_run = None
+    return True
+
+
+def should_run_queued_sequence_now() -> bool:
+    return pending_sequence_run is not None and len(pressed_physical_keys) == 0
+
+
+# -----------------------------------------------------------------------------
+# Input event handling
+# -----------------------------------------------------------------------------
+
+def handle_key_event(event, device_name: str, substitutions: dict, sequences: dict) -> None:
+    global pending_sequence_match
+
+    code = event.code
+    value = event.value
+
+    logger.debug(
+        "physical key %-14s %-6s dev=%s before_state=%s",
+        key_name(code),
+        value_name(value),
+        device_name,
+        state_snapshot(),
+    )
+
+    if value == 1:  # key down
+        pressed_physical_keys.add(code)
+
+        if xkb_decoder is not None:
+            xkb_decoder.update_key(code, True)
+
+        if code in ALL_MODIFIER_KEYS:
+            forward_event(event, "modifier_passthrough", device_name)
+            forwarded_modifier_keys.add(code)
+            return
+
+        combo = (frozenset(physical_modifiers()), code)
+        matched = substitutions.get(combo)
+        if matched:
+            triggered_combo_keys.add(code)
+            logger.info(
+                "matched combo=%s dev=%s output=%r",
+                matched["combo_text"],
+                device_name,
+                matched["output"],
+            )
+            release_forwarded_modifiers()
+            type_text(matched["output"])
+            return
+
+        forward_event(event, "normal_key_passthrough", device_name)
+        update_typed_buffer_from_keydown(code)
+        maybe_mark_pending_sequence(sequences, code)
+        return
+
+    if value == 0:  # key up
+        pressed_physical_keys.discard(code)
+
+        if xkb_decoder is not None:
+            xkb_decoder.update_key(code, False)
+
+        if code in suppressed_keyup_codes:
+            suppressed_keyup_codes.discard(code)
+            return
+
+        if code in triggered_combo_keys:
+            triggered_combo_keys.discard(code)
+            return
+
+        if code in ALL_MODIFIER_KEYS:
+            forwarded_modifier_keys.discard(code)
+
+        forward_event(event, "keyup_passthrough", device_name)
+        queue_pending_sequence_if_matches(code)
+        return
+
+    if value == 2:  # repeat
+        if code in triggered_combo_keys:
+            return
+
+        forward_event(event, "repeat_passthrough", device_name)
+
+
+# -----------------------------------------------------------------------------
+# Device setup and poll loop
+# -----------------------------------------------------------------------------
+
+def open_configured_devices(device_paths: list[str]) -> tuple[list[InputDevice], list[tuple[str, str]]]:
+    devices: list[InputDevice] = []
+    failures: list[tuple[str, str]] = []
+
+    for path in device_paths:
+        try:
+            dev = InputDevice(path)
+            devices.append(dev)
+            logger.info("opening device path=%s name=%s", dev.path, dev.name)
+        except FileNotFoundError:
+            failures.append((path, "not found"))
+            logger.warning("configured device is missing: %s", path)
+        except PermissionError:
+            failures.append((path, "permission denied"))
+            logger.warning("configured device is not accessible: %s", path)
+        except OSError as exc:
+            failures.append((path, str(exc)))
+            logger.warning("failed to open configured device %s: %s", path, exc)
+
+    return devices, failures
+
+
+def grab_devices(devices: list[InputDevice]) -> list[InputDevice]:
+    grabbed: list[InputDevice] = []
 
     for dev in devices:
         try:
+            dev.grab()
+            logger.info("grabbed device path=%s name=%s", dev.path, dev.name)
+            grabbed.append(dev)
+        except OSError as exc:
+            logger.warning("failed to grab device path=%s name=%s: %s", dev.path, dev.name, exc)
+            try:
+                dev.close()
+            except Exception:
+                pass
+
+    return grabbed
+
+
+def build_poller(devices: list[InputDevice]) -> tuple[select.poll, dict[int, InputDevice]]:
+    poller = select.poll()
+    fd_to_device: dict[int, InputDevice] = {}
+
+    for dev in devices:
+        poller.register(dev.fd, select.POLLIN)
+        fd_to_device[dev.fd] = dev
+
+    return poller, fd_to_device
+
+
+def remove_polled_device(
+    poller: select.poll,
+    fd_to_device: dict[int, InputDevice],
+    fd: int,
+    reason: str,
+) -> None:
+    dev = fd_to_device.pop(fd, None)
+
+    try:
+        poller.unregister(fd)
+    except Exception:
+        pass
+
+    if dev is None:
+        return
+
+    logger.warning(
+        "removing device fd=%s path=%s name=%s: %s",
+        fd,
+        getattr(dev, "path", "?"),
+        getattr(dev, "name", "?"),
+        reason,
+    )
+
+    try:
+        dev.ungrab()
+    except Exception:
+        pass
+
+    try:
+        dev.close()
+    except Exception:
+        pass
+
+
+# -----------------------------------------------------------------------------
+# Shutdown
+# -----------------------------------------------------------------------------
+
+def cleanup_and_exit(*_args) -> None:
+    global open_devices, virtual_uinput, xkb_decoder
+
+    if logger is not None:
+        logger.info("stopping")
+
+    for dev in open_devices:
+        try:
             dev.ungrab()
-            if log is not None:
-                log.info("released device path=%s name=%s", dev.path, dev.name)
+            if logger is not None:
+                logger.info("released device path=%s name=%s", dev.path, dev.name)
         except Exception:
             pass
 
     try:
-        if ui is not None:
-            ui.close()
+        if virtual_uinput is not None:
+            virtual_uinput.close()
     except Exception:
         pass
 
@@ -518,315 +910,65 @@ def cleanup_and_exit(*_args):
     sys.exit(0)
 
 
-def update_typed_buffer_from_keydown(code: int):
-    global typed_buffer
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
 
-    if code == ecodes.KEY_BACKSPACE:
-        typed_buffer = typed_buffer[:-1]
-        log.info("typed_buffer=%r", typed_buffer)
-        return
+def main() -> None:
+    global open_devices, virtual_uinput, logger, xkb_decoder
 
-    if code == ecodes.KEY_TAB:
-        typed_buffer += "\t"
-        typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
-        log.info("typed_buffer=%r", typed_buffer)
-        return
+    config_path, verbose, dump_config = parse_args()
+    logger = setup_logging(verbose)
+    logger.info("using config: %s", config_path)
 
-    if code == ecodes.KEY_ENTER:
-        typed_buffer += "\n"
-        typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
-        log.info("typed_buffer=%r", typed_buffer)
-        return
-
-    if code == ecodes.KEY_ESC:
-        typed_buffer = ""
-        log.info("typed_buffer=%r", typed_buffer)
-        return
-
-    if xkb_decoder is None:
-        return
-
-    ch = xkb_decoder.char_for_keydown(code)
-    if ch:
-        typed_buffer += ch
-        typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
-        log.info("typed_buffer=%r", typed_buffer)
-
-
-def maybe_mark_pending_sequence(sequences, last_code: int):
-    global pending_sequence_match
-
-    if pending_sequence_match is not None:
-        return False
-
-    if not sequences or not typed_buffer:
-        return False
-
-    for trigger, replacement in sequences.items():
-        if typed_buffer.endswith(trigger):
-            pending_sequence_match = {
-                "trigger": trigger,
-                "replacement": replacement,
-                "last_code": last_code,
-            }
-            log.info(
-                "pending sequence trigger=%r replacement=%r last_key=%s",
-                trigger,
-                replacement,
-                key_name(last_code),
-            )
-            return True
-
-    return False
-
-
-def queue_pending_sequence_if_matches(code: int):
-    global pending_sequence_match, pending_sequence_run
-
-    if pending_sequence_match is None:
-        return False
-
-    if pending_sequence_match["last_code"] != code:
-        return False
-
-    pending_sequence_run = pending_sequence_match
-    pending_sequence_match = None
-
-    log.info(
-        "queued sequence trigger=%r replacement=%r on keyup=%s",
-        pending_sequence_run["trigger"],
-        pending_sequence_run["replacement"],
-        key_name(code),
-    )
-    return True
-
-def run_queued_sequence_if_any():
-    global typed_buffer, pending_sequence_run
-
-    if pending_sequence_run is None:
-        return False
-
-    trigger = pending_sequence_run["trigger"]
-    replacement = pending_sequence_run["replacement"]
-
-    log.info("running queued sequence trigger=%r replacement=%r", trigger, replacement)
-
-    release_forwarded_modifiers()
-    send_backspaces(len(trigger), f"sequence_backspace({trigger})")
-    time.sleep(SEQUENCE_BACKSPACE_SETTLE_MS / 1000.0)
-    type_text(replacement)
-
-    typed_buffer = typed_buffer[:-len(trigger)] + replacement
-    typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
-    log.info("typed_buffer=%r", typed_buffer)
-
-    pending_sequence_run = None
-    return True
-
-
-def should_run_queued_sequence_now():
-    # Wait until the user has fully released all physical keys.
-    return pending_sequence_run is not None and len(pressed_physical) == 0
-
-
-def handle_key_event(event, dev_name: str, substitutions, sequences):
-    global pending_sequence_match
-
-    code = event.code
-    value = event.value
-
-    log.debug(
-        "physical key %-14s %-6s dev=%s before_state=%s",
-        key_name(code),
-        value_name(value),
-        dev_name,
-        state_snapshot(),
-    )
-
-    if value == 1:
-        pressed_physical.add(code)
-
-        if xkb_decoder is not None:
-            xkb_decoder.update_key(code, True)
-
-        if code in ALL_MODIFIER_KEYS:
-            forward_event(event, "modifier_passthrough", dev_name)
-            forwarded_modifiers.add(code)
-            return
-
-        combo = (frozenset(physical_modifiers()), code)
-        matched = substitutions.get(combo)
-
-        if matched:
-            triggered_keys.add(code)
-            log.info("matched combo=%s dev=%s output=%r", matched["combo_text"], dev_name, matched["output"])
-            release_forwarded_modifiers()
-            type_text(matched["output"])
-            return
-
-        forward_event(event, "normal_key_passthrough", dev_name)
-        update_typed_buffer_from_keydown(code)
-        maybe_mark_pending_sequence(sequences, code)
-        return
-
-    if value == 0:
-        pressed_physical.discard(code)
-
-        if xkb_decoder is not None:
-            xkb_decoder.update_key(code, False)
-
-        if code in suppressed_keyups:
-            suppressed_keyups.discard(code)
-            return
-
-        if code in triggered_keys:
-            triggered_keys.discard(code)
-            return
-
-        if code in ALL_MODIFIER_KEYS:
-            forwarded_modifiers.discard(code)
-
-        forward_event(event, "keyup_passthrough", dev_name)
-
-        queue_pending_sequence_if_matches(code)
-        return
-
-    if value == 2:
-        if code in triggered_keys:
-            return
-
-        forward_event(event, "repeat_passthrough", dev_name)
-        return
-
-
-def main():
-    global devices, ui, log, xkb_decoder
-
-    config_path, verbose, dump_config = get_paths()
-    log = setup_logging(verbose)
-    log.info("using config: %s", config_path)
-
-    dev_paths, substitutions, sequences, xkb_cfg = load_config(config_path)
+    device_paths, substitutions, sequences, xkb_config = load_config(config_path)
 
     if dump_config:
-        print(f"config: {config_path}")
-        print("devices:")
-        for d in dev_paths:
-            print(f"  - {d}")
-        print("substitutions:")
-        for v in substitutions.values():
-            print(f"  - {v['combo_text']} -> {v['output']}")
-        print("sequences:")
-        for trigger, replacement in sequences.items():
-            print(f"  - {trigger!r} -> {replacement!r}")
-        print("xkb:")
-        for k in ("rules", "model", "layout", "variant", "options"):
-            if xkb_cfg.get(k):
-                print(f"  - {k}: {xkb_cfg[k]}")
+        dump_loaded_config(config_path, device_paths, substitutions, sequences, xkb_config)
         return
 
-    xkb_decoder = XKBDecoder(xkb_cfg)
-    log.info("xkb layout info: %s", xkb_decoder.layout_info)
-    log.info("watching devices: %s", dev_paths)
-    log.info("watching substitutions: %s", [v["combo_text"] for v in substitutions.values()])
-    log.info("watching sequences: %s", list(sequences.keys()))
+    xkb_decoder = XKBDecoder(xkb_config)
+    logger.info("xkb layout info: %s", xkb_decoder.layout_info)
+    logger.info("watching devices: %s", device_paths)
+    logger.info("watching substitutions: %s", [item["combo_text"] for item in substitutions.values()])
+    logger.info("watching sequences: %s", list(sequences.keys()))
 
-
-
-
-    devices = []
-    failed_devices = []
-
-    for path in dev_paths:
-        try:
-            dev = InputDevice(path)
-            devices.append(dev)
-            log.info("opening device path=%s name=%s", dev.path, dev.name)
-        except FileNotFoundError:
-            failed_devices.append((path, "not found"))
-            log.warning("configured device is missing: %s", path)
-        except PermissionError:
-            failed_devices.append((path, "permission denied"))
-            log.warning("configured device is not accessible: %s", path)
-        except OSError as e:
-            failed_devices.append((path, str(e)))
-            log.warning("failed to open configured device %s: %s", path, e)
-
+    devices, failures = open_configured_devices(device_paths)
     if not devices:
         raise RuntimeError(
             "no configured input devices could be opened: "
-            + ", ".join(f"{path} ({reason})" for path, reason in failed_devices)
+            + ", ".join(f"{path} ({reason})" for path, reason in failures)
         )
 
-    if failed_devices:
-        log.warning(
+    if failures:
+        logger.warning(
             "some configured devices are unavailable at startup: %s",
-            ", ".join(f"{path} ({reason})" for path, reason in failed_devices),
+            ", ".join(f"{path} ({reason})" for path, reason in failures),
         )
 
-    ui = UInput.from_device(*devices, name="keyswap-uinput")
+    virtual_uinput = UInput.from_device(*devices, name="keyswap-uinput")
 
     signal.signal(signal.SIGINT, cleanup_and_exit)
     signal.signal(signal.SIGTERM, cleanup_and_exit)
 
-    still_open_devices = []
-    for dev in devices:
-        try:
-            dev.grab()
-            log.info("grabbed device path=%s name=%s", dev.path, dev.name)
-            still_open_devices.append(dev)
-        except OSError as e:
-            log.warning("failed to grab device path=%s name=%s: %s", dev.path, dev.name, e)
-            try:
-                dev.close()
-            except Exception:
-                pass
-
-    devices = still_open_devices
-
-    if not devices:
+    open_devices = grab_devices(devices)
+    if not open_devices:
         raise RuntimeError("configured input devices were opened, but none could be grabbed")
 
-    poller = select.poll()
-    fd_to_dev = {}
-
-    for dev in devices:
-        poller.register(dev.fd, select.POLLIN)
-        fd_to_dev[dev.fd] = dev
+    poller, fd_to_device = build_poller(open_devices)
 
     while True:
         ready = poller.poll()
 
         for fd, mask in ready:
             if mask & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
-                dev = fd_to_dev.pop(fd, None)
-                try:
-                    poller.unregister(fd)
-                except Exception:
-                    pass
-
-                if dev is not None:
-                    log.warning(
-                        "device fd=%s path=%s name=%s became invalid (mask=%s); removing from poll set",
-                        fd,
-                        getattr(dev, "path", "?"),
-                        getattr(dev, "name", "?"),
-                        mask,
-                    )
-                    try:
-                        dev.ungrab()
-                    except Exception:
-                        pass
-                    try:
-                        dev.close()
-                    except Exception:
-                        pass
+                remove_polled_device(poller, fd_to_device, fd, f"invalid poll mask={mask}")
                 continue
 
             if not (mask & select.POLLIN):
                 continue
 
-            dev = fd_to_dev.get(fd)
+            dev = fd_to_device.get(fd)
             if dev is None:
                 continue
 
@@ -840,31 +982,16 @@ def main():
 
             except BlockingIOError:
                 continue
-            except OSError as e:
-                log.warning(
-                    "device read failed fd=%s path=%s name=%s: %s; removing from poll set",
+            except OSError as exc:
+                remove_polled_device(
+                    poller,
+                    fd_to_device,
                     fd,
-                    getattr(dev, "path", "?"),
-                    getattr(dev, "name", "?"),
-                    e,
+                    f"device read failed: {exc}",
                 )
-                try:
-                    poller.unregister(fd)
-                except Exception:
-                    pass
-                fd_to_dev.pop(fd, None)
-                try:
-                    dev.ungrab()
-                except Exception:
-                    pass
-                try:
-                    dev.close()
-                except Exception:
-                    pass
 
-
-        if not fd_to_dev:
-            log.error("no input devices remain in poll set; exiting")
+        if not fd_to_device:
+            logger.error("no input devices remain in poll set; exiting")
             break
 
         if should_run_queued_sequence_now():

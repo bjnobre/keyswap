@@ -1,7 +1,7 @@
 Source: keyswap
 Section: utils
 Priority: optional
-Maintainer: Bene <bene@example.invalid>
+Maintainer: Bene <bene@bjnobre.com>
 Build-Depends: debhelper-compat (= 13), dh-python, python3
 Standards-Version: 4.7.0
 Rules-Requires-Root: no

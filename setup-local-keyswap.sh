@@ -16,12 +16,12 @@ NO_SERVICE=0
 usage() {
   cat <<'EOF'
 Usage:
-  ./setup-local-keyswap.sh /dev/input/event0 [/dev/input/event19 ...]
-  ./setup-local-keyswap.sh --force-config /dev/input/event0 /dev/input/event19
-  ./setup-local-keyswap.sh --no-service /dev/input/event0 /dev/input/event19
+  ./setup-local-keyswap.sh /dev/input/event0 [/dev/input/event21 ...]
+  ./setup-local-keyswap.sh --force-config /dev/input/event0 /dev/input/event21
+  ./setup-local-keyswap.sh --no-service /dev/input/event0 /dev/input/event21
 
 What it does:
-  - checks for python3-evdev
+  - checks for required runtime libraries
   - creates ~/.config/keyswap/config.json if absent
   - creates ~/.config/systemd/user/keyswap.service
   - optionally enables and starts the user service
@@ -53,7 +53,7 @@ parse_args() {
         usage
         exit 0
         ;;
-      /dev/input/event*)
+      /dev/input/event*|/dev/input/by-*|/dev/input/keyswap-*)
         DEVICES+=("$1")
         shift
         ;;
@@ -66,7 +66,7 @@ parse_args() {
 
 validate() {
   [[ -f "${APP_SCRIPT}" ]] || die "missing ${APP_SCRIPT}"
-  ((${#DEVICES[@]} > 0)) || die "no event devices provided"
+  ((${#DEVICES[@]} > 0)) || die "no input devices provided"
 
   for dev in "${DEVICES[@]}"; do
     [[ -e "${dev}" ]] || die "device does not exist: ${dev}"
@@ -74,6 +74,11 @@ validate() {
 
   python3 - <<'PY' >/dev/null 2>&1 || die "python3-evdev is not installed. Install it with: sudo apt install python3-evdev"
 import evdev
+PY
+
+  python3 - <<'PY' >/dev/null 2>&1 || die "libxkbcommon runtime is missing. Install it with: sudo apt install libxkbcommon0"
+import ctypes
+ctypes.cdll.LoadLibrary("libxkbcommon.so.0")
 PY
 }
 
@@ -99,6 +104,12 @@ write_config() {
     "C-nk_minus": "=",
     "C-nk_delete": ".",
     "A-C-S-g": "great!!!"
+  },
+  "sequences": {
+    ":123": "1234567890"
+  },
+  "xkb": {
+    "layout": "br"
   }
 }
 EOF
@@ -140,8 +151,8 @@ EOF
 
 start_service() {
   systemctl --user daemon-reload
-  systemctl --user enable --now "${APP_NAME}.service"
   systemctl --user reset-failed "${APP_NAME}.service" || true
+  systemctl --user enable --now "${APP_NAME}.service"
 
   echo
   systemctl --user status "${APP_NAME}.service" --no-pager
@@ -165,6 +176,11 @@ Useful commands:
 
 Edit mappings:
   ${USER_CONFIG_FILE}
+
+Note:
+  Removable keyboards are better configured through stable paths
+  (/dev/input/by-path, /dev/input/by-id, or custom udev symlinks)
+  than through raw /dev/input/eventN numbers.
 EOF
 }
 
