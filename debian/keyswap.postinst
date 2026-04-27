@@ -4,29 +4,99 @@ set -e
 case "$1" in
   configure)
     if ! getent group uinput >/dev/null 2>&1; then
-      addgroup --system uinput || true
+      addgroup --system uinput >/dev/null 2>&1 || true
     fi
 
-    udevadm control --reload-rules || true
-    udevadm trigger --subsystem-match=input || true
-    modprobe uinput || true
+    if command -v udevadm >/dev/null 2>&1; then
+      udevadm control --reload-rules || true
+    fi
+
+    if command -v modprobe >/dev/null 2>&1; then
+      modprobe uinput || true
+    fi
 
     cat <<'EOF'
+
 keyswap installed.
 
-Next steps for the target desktop user:
+Keyswap needs access to Linux input devices and to /dev/uinput.
+For a normal desktop user, finish the setup below.
 
-  1. Add the user to the required groups:
+1. Check whether the required groups exist:
+
+     getent group input
+     getent group uinput
+
+   The "input" group normally already exists.
+   The "uinput" group is created by this package if it was missing.
+
+2. Add your desktop user to the required groups:
+
      sudo usermod -aG input,uinput <username>
 
-  2. Log out and log back in.
+   Example:
 
-  3. Create or edit:
+     sudo usermod -aG input,uinput "$USER"
+
+3. Log out and log back in.
+
+   This is required because group membership is loaded when the user session starts.
+   Opening a new terminal is usually not enough.
+
+4. After logging back in, verify your groups:
+
+     groups
+
+   You should see both:
+
+     input uinput
+
+5. Verify that the uinput device exists:
+
+     ls -l /dev/uinput
+
+   The device should exist and be accessible through the uinput group.
+
+6. Configure keyswap.
+
+   Keyswap reads its configuration from this user file, when it exists:
+
      ~/.config/keyswap/config.json
 
-  4. Enable the user service:
+   If the user file does not exist, keyswap falls back to:
+
+     /etc/keyswap/config.json
+
+   Start by copying the system example to your user config:
+
+     mkdir -p ~/.config/keyswap
+     cp /etc/keyswap/config.json ~/.config/keyswap/config.json
+     editor ~/.config/keyswap/config.json
+
+   In this file, define which input devices keyswap should listen to and which
+   key sequences should be replaced.
+
+   After editing the file, restart the user service:
+
+     systemctl --user restart keyswap.service
+
+   Check logs if the configuration is invalid:
+
+     journalctl --user -u keyswap.service -e
+
+7. Enable and start the user service:
+
      systemctl --user daemon-reload
      systemctl --user enable --now keyswap.service
+
+8. Check service status:
+
+     systemctl --user status keyswap.service
+
+9. View logs if something fails:
+
+     journalctl --user -u keyswap.service -e
+
 EOF
     ;;
 esac
