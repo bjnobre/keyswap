@@ -29,6 +29,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+DeviceSelection = list[str] | str
+
 from evdev import InputDevice, UInput, ecodes
 
 # -----------------------------------------------------------------------------
@@ -36,6 +38,43 @@ from evdev import InputDevice, UInput, ecodes
 # -----------------------------------------------------------------------------
 
 SYSTEM_CONFIG_PATH = Path("/etc/keyswap/config.json")
+INPUT_EVENT_GLOB = "/dev/input/event*"
+AUTO_DEVICES_MODE = "auto"
+AUTO_RESCAN_INTERVAL_SEC = 60.0
+AUTO_POLL_TIMEOUT_MS = 500
+INPUT_DIR = Path("/dev/input")
+
+# Linux inotify constants. Used to avoid rescanning /dev/input on a timer.
+IN_CREATE = 0x00000100
+IN_DELETE = 0x00000200
+IN_MOVED_FROM = 0x00000040
+IN_MOVED_TO = 0x00000080
+IN_ATTRIB = 0x00000004
+IN_NONBLOCK = 0x00000800
+IN_CLOEXEC = 0x00080000
+INOTIFY_EVENT_MASK = IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_ATTRIB
+
+REAL_KEYBOARD_PROBE_KEYS = {
+    ecodes.KEY_A, ecodes.KEY_B, ecodes.KEY_C, ecodes.KEY_D, ecodes.KEY_E,
+    ecodes.KEY_F, ecodes.KEY_G, ecodes.KEY_H, ecodes.KEY_I, ecodes.KEY_J,
+    ecodes.KEY_K, ecodes.KEY_L, ecodes.KEY_M, ecodes.KEY_N, ecodes.KEY_O,
+    ecodes.KEY_P, ecodes.KEY_Q, ecodes.KEY_R, ecodes.KEY_S, ecodes.KEY_T,
+    ecodes.KEY_U, ecodes.KEY_V, ecodes.KEY_W, ecodes.KEY_X, ecodes.KEY_Y,
+    ecodes.KEY_Z, ecodes.KEY_SPACE,
+}
+
+KEYSWAP_UINPUT_NAME = "keyswap-uinput"
+PSEUDO_KEYBOARD_NAMES = {
+    KEYSWAP_UINPUT_NAME,
+    "Power Button",
+    "Sleep Button",
+    "Video Bus",
+    "Intel HID events",
+    "Intel HID 5 button array",
+    "PC Speaker",
+    "Dell WMI hotkeys",
+    "HDA Digital PCBeep",
+}
 
 # Timing controls for sequence expansion.
 SEQUENCE_BACKSPACE_SETTLE_MS = 20
@@ -419,7 +458,7 @@ def parse_combo(combo: str) -> tuple[set[str], int]:
     return required_modifiers, parse_key(parts[-1])
 
 
-def load_config(config_path: Path) -> tuple[list[str], dict, dict, dict]:
+def load_config(config_path: Path) -> tuple[DeviceSelection, dict, dict, dict]:
     global max_sequence_len
 
     with open(config_path, "r", encoding="utf-8") as handle:
@@ -429,13 +468,24 @@ def load_config(config_path: Path) -> tuple[list[str], dict, dict, dict]:
         raise ValueError("config must contain 'substitutions'")
 
     if "devices" in raw:
-        device_paths = raw["devices"]
-        if not isinstance(device_paths, list) or not device_paths:
-            raise ValueError("'devices' must be a non-empty list")
+        configured_devices = raw["devices"]
     elif "device" in raw:
-        device_paths = [raw["device"]]
+        configured_devices = raw["device"]
     else:
-        raise ValueError("config must contain 'device' or 'devices'")
+        configured_devices = AUTO_DEVICES_MODE
+
+    if configured_devices == AUTO_DEVICES_MODE:
+        device_selection: DeviceSelection = AUTO_DEVICES_MODE
+    elif isinstance(configured_devices, str):
+        device_selection = [configured_devices]
+    elif isinstance(configured_devices, list) and configured_devices == [AUTO_DEVICES_MODE]:
+        device_selection = AUTO_DEVICES_MODE
+    elif isinstance(configured_devices, list) and configured_devices:
+        if not all(isinstance(item, str) and item for item in configured_devices):
+            raise ValueError("'devices' entries must be non-empty strings")
+        device_selection = configured_devices
+    else:
+        raise ValueError("'devices' must be 'auto' or a non-empty list of paths")
 
     substitutions = {}
     for combo, output in raw["substitutions"].items():
@@ -454,20 +504,23 @@ def load_config(config_path: Path) -> tuple[list[str], dict, dict, dict]:
         raise ValueError("'xkb' must be an object/map when present")
 
     max_sequence_len = max((len(trigger) for trigger in sequences), default=0)
-    return device_paths, substitutions, sequences, xkb_config
+    return device_selection, substitutions, sequences, xkb_config
 
 
 def dump_loaded_config(
     config_path: Path,
-    device_paths: list[str],
+    device_selection: DeviceSelection,
     substitutions: dict,
     sequences: dict,
     xkb_config: dict,
 ) -> None:
     print(f"config: {config_path}")
     print("devices:")
-    for path in device_paths:
-        print(f"  - {path}")
+    if device_selection == AUTO_DEVICES_MODE:
+        print("  - auto")
+    else:
+        for path in device_selection:
+            print(f"  - {path}")
 
     print("substitutions:")
     for item in substitutions.values():
@@ -791,6 +844,71 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
 # Device setup and poll loop
 # -----------------------------------------------------------------------------
 
+def event_path_sort_key(path: str) -> tuple[int, str]:
+    name = Path(path).name
+    if name.startswith("event") and name[5:].isdigit():
+        return int(name[5:]), path
+    return sys.maxsize, path
+
+
+def device_key_codes(dev: InputDevice) -> set[int]:
+    try:
+        key_codes = dev.capabilities(verbose=False).get(ecodes.EV_KEY, [])
+    except OSError:
+        return set()
+
+    codes: set[int] = set()
+    for item in key_codes:
+        if isinstance(item, int):
+            codes.add(item)
+        elif isinstance(item, tuple) and item and isinstance(item[0], int):
+            codes.add(item[0])
+    return codes
+
+
+def should_auto_include_device(dev: InputDevice) -> bool:
+    if dev.name in PSEUDO_KEYBOARD_NAMES:
+        return False
+
+    key_codes = device_key_codes(dev)
+    if not key_codes:
+        return False
+
+    # Real typing keyboards expose ordinary text keys. Pseudo keyboard-like
+    # devices usually expose only power, brightness, rfkill, audio, or WMI keys.
+    return bool(key_codes & REAL_KEYBOARD_PROBE_KEYS)
+
+
+def discover_keyboard_device_paths() -> list[str]:
+    discovered: list[str] = []
+
+    for path in sorted(INPUT_DIR.glob("event*"), key=lambda item: event_path_sort_key(str(item))):
+        path_text = str(path)
+        dev: InputDevice | None = None
+        try:
+            dev = InputDevice(path_text)
+            if should_auto_include_device(dev):
+                discovered.append(path_text)
+                logger.info("auto-discovered keyboard path=%s name=%s", path_text, dev.name)
+            else:
+                logger.debug("auto-skipped input path=%s name=%s", path_text, dev.name)
+        except (FileNotFoundError, PermissionError, OSError) as exc:
+            logger.debug("auto-scan skipped path=%s: %s", path_text, exc)
+        finally:
+            if dev is not None:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+
+    return discovered
+
+def resolve_device_paths(device_selection: DeviceSelection) -> list[str]:
+    if device_selection == AUTO_DEVICES_MODE:
+        return discover_keyboard_device_paths()
+    return list(device_selection)
+
+
 def open_configured_devices(device_paths: list[str]) -> tuple[list[InputDevice], list[tuple[str, str]]]:
     devices: list[InputDevice] = []
     failures: list[tuple[str, str]] = []
@@ -842,12 +960,85 @@ def build_poller(devices: list[InputDevice]) -> tuple[select.poll, dict[int, Inp
     return poller, fd_to_device
 
 
+
+
+def setup_input_dir_inotify() -> int | None:
+    """Watch /dev/input for event device changes without periodic scanning."""
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        inotify_init1 = libc.inotify_init1
+        inotify_init1.argtypes = [ctypes.c_int]
+        inotify_init1.restype = ctypes.c_int
+        inotify_add_watch = libc.inotify_add_watch
+        inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        inotify_add_watch.restype = ctypes.c_int
+
+        fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC)
+        if fd < 0:
+            err = ctypes.get_errno()
+            logger.warning("failed to initialize inotify: %s", os.strerror(err))
+            return None
+
+        watch = inotify_add_watch(fd, str(INPUT_DIR).encode("utf-8"), INOTIFY_EVENT_MASK)
+        if watch < 0:
+            err = ctypes.get_errno()
+            os.close(fd)
+            logger.warning("failed to watch %s with inotify: %s", INPUT_DIR, os.strerror(err))
+            return None
+
+        logger.info("watching %s for input device changes via inotify", INPUT_DIR)
+        return fd
+    except Exception as exc:
+        logger.warning("inotify setup failed; falling back to slow periodic rescan: %s", exc)
+        return None
+
+
+def drain_inotify_events(fd: int) -> None:
+    """Drain pending inotify records. Names are not needed; any event triggers a rescan."""
+    while True:
+        try:
+            data = os.read(fd, 4096)
+        except BlockingIOError:
+            return
+        except OSError as exc:
+            logger.warning("failed reading inotify fd=%s: %s", fd, exc)
+            return
+        if not data:
+            return
+
+
+def add_auto_discovered_devices(
+    poller: select.poll,
+    fd_to_device: dict[int, InputDevice],
+) -> None:
+    active_paths = {dev.path for dev in fd_to_device.values()}
+
+    for path in discover_keyboard_device_paths():
+        if path in active_paths:
+            continue
+
+        try:
+            dev = InputDevice(path)
+            dev.grab()
+            poller.register(dev.fd, select.POLLIN)
+            fd_to_device[dev.fd] = dev
+            open_devices.append(dev)
+            active_paths.add(path)
+            logger.info("auto-added keyboard path=%s name=%s", dev.path, dev.name)
+        except PermissionError:
+            logger.warning("auto-discovered keyboard is not accessible: %s", path)
+        except OSError as exc:
+            logger.warning("failed to add auto-discovered keyboard %s: %s", path, exc)
+
+
 def remove_polled_device(
     poller: select.poll,
     fd_to_device: dict[int, InputDevice],
     fd: int,
     reason: str,
 ) -> None:
+    global open_devices
+
     dev = fd_to_device.pop(fd, None)
 
     try:
@@ -857,6 +1048,8 @@ def remove_polled_device(
 
     if dev is None:
         return
+
+    open_devices = [item for item in open_devices if item.fd != fd]
 
     logger.warning(
         "removing device fd=%s path=%s name=%s: %s",
@@ -921,22 +1114,24 @@ def main() -> None:
     logger = setup_logging(verbose)
     logger.info("using config: %s", config_path)
 
-    device_paths, substitutions, sequences, xkb_config = load_config(config_path)
+    device_selection, substitutions, sequences, xkb_config = load_config(config_path)
 
     if dump_config:
-        dump_loaded_config(config_path, device_paths, substitutions, sequences, xkb_config)
+        dump_loaded_config(config_path, device_selection, substitutions, sequences, xkb_config)
         return
 
     xkb_decoder = XKBDecoder(xkb_config)
     logger.info("xkb layout info: %s", xkb_decoder.layout_info)
-    logger.info("watching devices: %s", device_paths)
+    logger.info("watching devices: %s", device_selection)
     logger.info("watching substitutions: %s", [item["combo_text"] for item in substitutions.values()])
     logger.info("watching sequences: %s", list(sequences.keys()))
 
+    auto_discovery_enabled = device_selection == AUTO_DEVICES_MODE
+    device_paths = resolve_device_paths(device_selection)
     devices, failures = open_configured_devices(device_paths)
     if not devices:
         raise RuntimeError(
-            "no configured input devices could be opened: "
+            "no input devices could be opened: "
             + ", ".join(f"{path} ({reason})" for path, reason in failures)
         )
 
@@ -946,7 +1141,7 @@ def main() -> None:
             ", ".join(f"{path} ({reason})" for path, reason in failures),
         )
 
-    virtual_uinput = UInput.from_device(*devices, name="keyswap-uinput")
+    virtual_uinput = UInput.from_device(*devices, name=KEYSWAP_UINPUT_NAME)
 
     signal.signal(signal.SIGINT, cleanup_and_exit)
     signal.signal(signal.SIGTERM, cleanup_and_exit)
@@ -956,11 +1151,37 @@ def main() -> None:
         raise RuntimeError("configured input devices were opened, but none could be grabbed")
 
     poller, fd_to_device = build_poller(open_devices)
+    last_auto_rescan = time.monotonic()
+    input_dir_inotify_fd = setup_input_dir_inotify() if auto_discovery_enabled else None
+    pending_auto_rescan = False
+    if input_dir_inotify_fd is not None:
+        poller.register(input_dir_inotify_fd, select.POLLIN)
 
     while True:
-        ready = poller.poll()
+        poll_timeout = AUTO_POLL_TIMEOUT_MS if auto_discovery_enabled and input_dir_inotify_fd is None else None
+        ready = poller.poll(poll_timeout)
 
         for fd, mask in ready:
+            if input_dir_inotify_fd is not None and fd == input_dir_inotify_fd:
+                if mask & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                    logger.warning("input directory inotify watch failed; falling back to slow periodic rescan")
+                    try:
+                        poller.unregister(input_dir_inotify_fd)
+                    except Exception:
+                        pass
+                    try:
+                        os.close(input_dir_inotify_fd)
+                    except Exception:
+                        pass
+                    input_dir_inotify_fd = None
+                    last_auto_rescan = time.monotonic()
+                    continue
+
+                if mask & select.POLLIN:
+                    drain_inotify_events(fd)
+                    pending_auto_rescan = True
+                continue
+
             if mask & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
                 remove_polled_device(poller, fd_to_device, fd, f"invalid poll mask={mask}")
                 continue
@@ -975,7 +1196,9 @@ def main() -> None:
             try:
                 for event in dev.read():
                     if event.type != ecodes.EV_KEY:
-                        forward_event(event, "non_key_passthrough", dev.name)
+                        # Keyswap only remaps keyboard keys. Forwarding EV_SYN/MSC
+                        # from grabbed physical devices adds needless work and can
+                        # make typing feel delayed on busy devices.
                         continue
 
                     handle_key_event(event, dev.name, substitutions, sequences)
@@ -990,7 +1213,24 @@ def main() -> None:
                     f"device read failed: {exc}",
                 )
 
+        if auto_discovery_enabled:
+            if pending_auto_rescan:
+                add_auto_discovered_devices(poller, fd_to_device)
+                pending_auto_rescan = False
+                last_auto_rescan = time.monotonic()
+            elif input_dir_inotify_fd is None and time.monotonic() - last_auto_rescan >= AUTO_RESCAN_INTERVAL_SEC:
+                add_auto_discovered_devices(poller, fd_to_device)
+                last_auto_rescan = time.monotonic()
+
         if not fd_to_device:
+            if auto_discovery_enabled:
+                logger.warning("no input devices remain in poll set; waiting for auto-discovery")
+                if input_dir_inotify_fd is None:
+                    time.sleep(AUTO_RESCAN_INTERVAL_SEC)
+                else:
+                    pending_auto_rescan = True
+                continue
+
             logger.error("no input devices remain in poll set; exiting")
             break
 
