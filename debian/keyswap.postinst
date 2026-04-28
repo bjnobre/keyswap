@@ -73,8 +73,19 @@ For a normal desktop user, finish the setup below.
      cp /etc/keyswap/config.json ~/.config/keyswap/config.json
      editor ~/.config/keyswap/config.json
 
-   In this file, define which input devices keyswap should listen to and which
-   key sequences should be replaced.
+   The recommended device setting is:
+
+     "devices": "auto"
+
+   This makes keyswap listen to real keyboard devices, including the internal
+   laptop keyboard and connected USB/Bluetooth keyboards. It excludes its own
+   virtual output device and common pseudo-keyboard devices.
+
+   Static device paths are still supported, but /dev/input/eventN numbers may
+   change after reconnects.
+
+   In this file, define which key combinations and typed sequences should be
+   replaced.
 
    After editing the file, restart the user service:
 

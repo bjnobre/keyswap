@@ -7,6 +7,7 @@ keyswap installs:
 - a fallback configuration in /etc/keyswap/config.json
 - a systemd user unit: keyswap.service
 - a udev rule for input access
+- automatic keyboard discovery when config uses "devices": "auto"
 
 Configuration precedence
 ------------------------
@@ -26,6 +27,12 @@ Create your personal config:
 
     mkdir -p ~/.config/keyswap
     cp /etc/keyswap/config.json ~/.config/keyswap/config.json
+
+The recommended device setting is:
+
+    "devices": "auto"
+
+This listens to real keyboard devices, including the internal laptop keyboard and connected USB/Bluetooth keyboards, while excluding keyswap's own virtual output device and common pseudo-keyboards. Static device paths remain supported, but /dev/input/eventN numbers may change after reconnects.
 
 Enable the user service:
 

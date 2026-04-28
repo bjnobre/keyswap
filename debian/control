@@ -18,8 +18,9 @@ Depends:
  python3,
  python3-evdev
 Description: user-level keyboard substitution daemon using evdev and uinput
- Keyswap listens to configured input devices, detects configured key
- combinations, and injects replacement text through uinput.
+ Keyswap listens to configured or automatically discovered keyboard
+ devices, detects configured key combinations, and injects replacement
+ text through uinput.
  .
  It is intended to run as a per-user systemd service with a user-owned
  configuration file and a fallback system configuration.
