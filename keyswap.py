@@ -205,8 +205,8 @@ CHARMAP = {
     ">": (ecodes.KEY_DOT, True),
     ",": (ecodes.KEY_COMMA, False),
     "<": (ecodes.KEY_COMMA, True),
-    "/": (ecodes.KEY_SLASH, False),
-    "?": (ecodes.KEY_SLASH, True),
+    "/": (ecodes.KEY_RO, False),
+    "?": (ecodes.KEY_RO, True),
     ";": (ecodes.KEY_SEMICOLON, False),
     ":": (ecodes.KEY_SEMICOLON, True),
     "'": (ecodes.KEY_APOSTROPHE, False),
@@ -232,6 +232,8 @@ CHARMAP = {
     "(": (ecodes.KEY_9, True),
     ")": (ecodes.KEY_0, True),
 }
+
+CHARMAP_KEYCODES = {keycode for keycode, _needs_shift in CHARMAP.values()}
 
 # -----------------------------------------------------------------------------
 # Runtime mutable state
@@ -539,6 +541,41 @@ def dump_loaded_config(
 # -----------------------------------------------------------------------------
 # State helpers
 # -----------------------------------------------------------------------------
+def release_all_virtual_keys(reason: str) -> None:
+    global pressed_physical_keys
+    global forwarded_modifier_keys
+    global suppressed_keyup_codes
+    global triggered_combo_keys
+
+    if virtual_uinput is None:
+        return
+
+    keys_to_release = sorted({
+        *ALL_MODIFIER_KEYS,
+        *CHARMAP_KEYCODES,
+        *pressed_physical_keys,
+        *forwarded_modifier_keys,
+        *suppressed_keyup_codes,
+        *triggered_combo_keys,
+    })
+
+    if logger is not None:
+        logger.warning(
+            "force releasing virtual keys reason=%s keys=%s",
+            reason,
+            [key_name(code) for code in keys_to_release],
+        )
+
+    for code in keys_to_release:
+        virtual_uinput.write(ecodes.EV_KEY, code, 0)
+
+    virtual_uinput.syn()
+
+    pressed_physical_keys.clear()
+    forwarded_modifier_keys.clear()
+    suppressed_keyup_codes.clear()
+    triggered_combo_keys.clear()
+
 
 def key_name(code: int) -> str:
     return ecodes.KEY.get(code, f"UNKNOWN_{code}")
@@ -1089,6 +1126,11 @@ def cleanup_and_exit(*_args) -> None:
             pass
 
     try:
+        release_all_virtual_keys("shutdown")
+    except Exception:
+        pass
+
+    try:
         if virtual_uinput is not None:
             virtual_uinput.close()
     except Exception:
@@ -1142,6 +1184,7 @@ def main() -> None:
         )
 
     virtual_uinput = UInput.from_device(*devices, name=KEYSWAP_UINPUT_NAME)
+    release_all_virtual_keys("startup")
 
     signal.signal(signal.SIGINT, cleanup_and_exit)
     signal.signal(signal.SIGTERM, cleanup_and_exit)
