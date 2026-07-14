@@ -240,6 +240,20 @@ CHARMAP = {
 
 CHARMAP_KEYCODES = {keycode for keycode, _needs_shift in CHARMAP.values()}
 
+# Uinput capabilities cannot be expanded after the virtual device is created.
+# Keep navigation keys available even when the keyboard that provides them is
+# disconnected at startup and added later by auto-discovery.
+NAVIGATION_KEYCODES = {
+    ecodes.KEY_HOME,
+    ecodes.KEY_UP,
+    ecodes.KEY_PAGEUP,
+    ecodes.KEY_LEFT,
+    ecodes.KEY_RIGHT,
+    ecodes.KEY_END,
+    ecodes.KEY_DOWN,
+    ecodes.KEY_PAGEDOWN,
+}
+
 # -----------------------------------------------------------------------------
 # Runtime mutable state
 # -----------------------------------------------------------------------------
@@ -410,9 +424,9 @@ def resolve_user_config_path() -> Path:
     return Path.home() / ".config" / "keyswap" / "config.json"
 
 
-def setup_logging(verbose: bool) -> logging.Logger:
+def setup_logging(log_level: str) -> logging.Logger:
     handlers = [logging.StreamHandler(sys.stdout)]
-    level = logging.DEBUG if verbose else logging.WARNING
+    level = getattr(logging, log_level.upper())
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -421,21 +435,32 @@ def setup_logging(verbose: bool) -> logging.Logger:
     return logging.getLogger("keyswap")
 
 
-def parse_args() -> tuple[Path, bool, bool]:
+def parse_args() -> tuple[Path, str, bool]:
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--config", help="Explicit config path")
-    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--log-level",
+        choices=("warning", "info", "debug"),
+        default="warning",
+        help="Logging detail (default: warning)",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Alias for --log-level debug",
+    )
     parser.add_argument("--dump-config", action="store_true")
     args = parser.parse_args()
+    log_level = "debug" if args.verbose else args.log_level
 
     if args.config:
-        return Path(args.config).expanduser().resolve(), args.verbose, args.dump_config
+        return Path(args.config).expanduser().resolve(), log_level, args.dump_config
 
     user_config = resolve_user_config_path()
     if user_config.is_file():
-        return user_config.resolve(), args.verbose, args.dump_config
+        return user_config.resolve(), log_level, args.dump_config
 
-    return SYSTEM_CONFIG_PATH, args.verbose, args.dump_config
+    return SYSTEM_CONFIG_PATH, log_level, args.dump_config
 
 
 def parse_key(name: str) -> int:
@@ -795,6 +820,20 @@ def forward_event(event, reason: str, device_name: str) -> None:
     virtual_uinput.syn()
 
 
+def create_virtual_uinput(devices: list[InputDevice]) -> UInput:
+    """Create the fixed-capability output device used by current and future inputs."""
+    capabilities: dict[int, set[Any]] = {}
+
+    for dev in devices:
+        for event_type, event_codes in dev.capabilities().items():
+            if event_type in (ecodes.EV_SYN, ecodes.EV_FF):
+                continue
+            capabilities.setdefault(event_type, set()).update(event_codes)
+
+    capabilities.setdefault(ecodes.EV_KEY, set()).update(NAVIGATION_KEYCODES)
+    return UInput(events=capabilities, name=KEYSWAP_UINPUT_NAME)
+
+
 # -----------------------------------------------------------------------------
 # Sequence expansion helpers
 # -----------------------------------------------------------------------------
@@ -804,24 +843,24 @@ def update_typed_buffer_from_keydown(code: int) -> None:
 
     if code == ecodes.KEY_BACKSPACE:
         typed_buffer = typed_buffer[:-1]
-        logger.info("typed_buffer=%r", typed_buffer)
+        logger.debug("typed_buffer=%r", typed_buffer)
         return
 
     if code == ecodes.KEY_TAB:
         typed_buffer += "\t"
         typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
-        logger.info("typed_buffer=%r", typed_buffer)
+        logger.debug("typed_buffer=%r", typed_buffer)
         return
 
     if code == ecodes.KEY_ENTER:
         typed_buffer += "\n"
         typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
-        logger.info("typed_buffer=%r", typed_buffer)
+        logger.debug("typed_buffer=%r", typed_buffer)
         return
 
     if code == ecodes.KEY_ESC:
         typed_buffer = ""
-        logger.info("typed_buffer=%r", typed_buffer)
+        logger.debug("typed_buffer=%r", typed_buffer)
         return
 
     if xkb_decoder is None:
@@ -831,7 +870,7 @@ def update_typed_buffer_from_keydown(code: int) -> None:
     if ch:
         typed_buffer += ch
         typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
-        logger.info("typed_buffer=%r", typed_buffer)
+        logger.debug("typed_buffer=%r", typed_buffer)
 
 
 def maybe_mark_pending_sequence(sequences: dict[str, str], last_code: int) -> bool:
@@ -896,7 +935,7 @@ def run_queued_sequence_if_any() -> bool:
 
     typed_buffer = typed_buffer[:-len(trigger)] + replacement
     typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
-    logger.info("typed_buffer=%r", typed_buffer)
+    logger.debug("typed_buffer=%r", typed_buffer)
 
     pending_sequence_run = None
     return True
@@ -1221,6 +1260,12 @@ def remove_polled_device(
     if dev is None:
         return
 
+    # A disappearing device may never deliver key-up events for keys that were
+    # held when it disconnected. Release the shared virtual state immediately;
+    # otherwise compositors such as Sway can consider that key held across the
+    # whole seat and suppress the same key from every attached keyboard.
+    release_all_virtual_keys(f"device_removed({getattr(dev, 'name', '?')})")
+
     open_devices = [item for item in open_devices if item.fd != fd]
 
     logger.warning(
@@ -1287,8 +1332,8 @@ def cleanup_and_exit(*_args) -> None:
 def main() -> None:
     global open_devices, virtual_uinput, logger, xkb_decoder, last_poll_wakeup_time
 
-    config_path, verbose, dump_config = parse_args()
-    logger = setup_logging(verbose)
+    config_path, log_level, dump_config = parse_args()
+    logger = setup_logging(log_level)
     logger.info("using config: %s", config_path)
 
     device_selection, substitutions, sequences, xkb_config = load_config(config_path)
@@ -1318,7 +1363,7 @@ def main() -> None:
             ", ".join(f"{path} ({reason})" for path, reason in failures),
         )
 
-    virtual_uinput = UInput.from_device(*devices, name=KEYSWAP_UINPUT_NAME)
+    virtual_uinput = create_virtual_uinput(devices)
     release_all_virtual_keys("startup")
 
     signal.signal(signal.SIGINT, cleanup_and_exit)
