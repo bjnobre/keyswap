@@ -127,7 +127,7 @@ Description=Keyswap keyboard substitution daemon
 
 [Service]
 Type=simple
-ExecStart=${APP_SCRIPT}
+ExecStart=${APP_SCRIPT} --log-level info
 WorkingDirectory=${SCRIPT_DIR}
 Restart=on-failure
 RestartSec=1

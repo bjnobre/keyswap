@@ -26,6 +26,7 @@ import select
 import signal
 import sys
 import time
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,10 @@ from evdev import InputDevice, UInput, ecodes
 # -----------------------------------------------------------------------------
 # Configuration and constants
 # -----------------------------------------------------------------------------
+
+DEBUG_BEEP_ON_KEY_EVENTS = True
+DEBUG_BEEP_ON_REPEAT = True
+DEBUG_BEEP_COMMAND = ["gsound-play", "-i", "bell"]
 
 SYSTEM_CONFIG_PATH = Path("/etc/keyswap/config.json")
 INPUT_EVENT_GLOB = "/dev/input/event*"
@@ -77,9 +82,9 @@ PSEUDO_KEYBOARD_NAMES = {
 }
 
 # Timing controls for sequence expansion.
-SEQUENCE_BACKSPACE_SETTLE_MS = 20
-TYPE_CHAR_DELAY_MS = 20
-BACKSPACE_DELAY_MS = 2
+SEQUENCE_BACKSPACE_SETTLE_MS = 10
+TYPE_CHAR_DELAY_MS = 5
+BACKSPACE_DELAY_MS = 1
 
 # XKB constants.
 XKB_CONTEXT_NO_FLAGS = 0
@@ -235,6 +240,20 @@ CHARMAP = {
 
 CHARMAP_KEYCODES = {keycode for keycode, _needs_shift in CHARMAP.values()}
 
+# Uinput capabilities cannot be expanded after the virtual device is created.
+# Keep navigation keys available even when the keyboard that provides them is
+# disconnected at startup and added later by auto-discovery.
+NAVIGATION_KEYCODES = {
+    ecodes.KEY_HOME,
+    ecodes.KEY_UP,
+    ecodes.KEY_PAGEUP,
+    ecodes.KEY_LEFT,
+    ecodes.KEY_RIGHT,
+    ecodes.KEY_END,
+    ecodes.KEY_DOWN,
+    ecodes.KEY_PAGEDOWN,
+}
+
 # -----------------------------------------------------------------------------
 # Runtime mutable state
 # -----------------------------------------------------------------------------
@@ -243,6 +262,10 @@ pressed_physical_keys: set[int] = set()
 forwarded_modifier_keys: set[int] = set()
 suppressed_keyup_codes: set[int] = set()
 triggered_combo_keys: set[int] = set()
+virtual_pressed_keys: set[int] = set()
+
+last_debug_beep_time = 0.0
+last_poll_wakeup_time = time.monotonic()
 
 typed_buffer = ""
 max_sequence_len = 0
@@ -401,9 +424,9 @@ def resolve_user_config_path() -> Path:
     return Path.home() / ".config" / "keyswap" / "config.json"
 
 
-def setup_logging(verbose: bool) -> logging.Logger:
+def setup_logging(log_level: str) -> logging.Logger:
     handlers = [logging.StreamHandler(sys.stdout)]
-    level = logging.DEBUG if verbose else logging.WARNING
+    level = getattr(logging, log_level.upper())
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -412,21 +435,32 @@ def setup_logging(verbose: bool) -> logging.Logger:
     return logging.getLogger("keyswap")
 
 
-def parse_args() -> tuple[Path, bool, bool]:
+def parse_args() -> tuple[Path, str, bool]:
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--config", help="Explicit config path")
-    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--log-level",
+        choices=("warning", "info", "debug"),
+        default="warning",
+        help="Logging detail (default: warning)",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Alias for --log-level debug",
+    )
     parser.add_argument("--dump-config", action="store_true")
     args = parser.parse_args()
+    log_level = "debug" if args.verbose else args.log_level
 
     if args.config:
-        return Path(args.config).expanduser().resolve(), args.verbose, args.dump_config
+        return Path(args.config).expanduser().resolve(), log_level, args.dump_config
 
     user_config = resolve_user_config_path()
     if user_config.is_file():
-        return user_config.resolve(), args.verbose, args.dump_config
+        return user_config.resolve(), log_level, args.dump_config
 
-    return SYSTEM_CONFIG_PATH, args.verbose, args.dump_config
+    return SYSTEM_CONFIG_PATH, log_level, args.dump_config
 
 
 def parse_key(name: str) -> int:
@@ -546,6 +580,7 @@ def release_all_virtual_keys(reason: str) -> None:
     global forwarded_modifier_keys
     global suppressed_keyup_codes
     global triggered_combo_keys
+    global virtual_pressed_keys
 
     if virtual_uinput is None:
         return
@@ -557,17 +592,29 @@ def release_all_virtual_keys(reason: str) -> None:
         *forwarded_modifier_keys,
         *suppressed_keyup_codes,
         *triggered_combo_keys,
+        *virtual_pressed_keys,
+        ecodes.KEY_UP,
+        ecodes.KEY_DOWN,
+        ecodes.KEY_LEFT,
+        ecodes.KEY_RIGHT,
+        ecodes.KEY_HOME,
+        ecodes.KEY_END,
+        ecodes.KEY_PAGEUP,
+        ecodes.KEY_PAGEDOWN,
+        ecodes.KEY_BACKSPACE,
+        ecodes.KEY_SPACE,
     })
 
     if logger is not None:
-        logger.warning(
+        log = logger.debug if reason == "startup" else logger.warning
+        log(
             "force releasing virtual keys reason=%s keys=%s",
             reason,
             [key_name(code) for code in keys_to_release],
         )
 
     for code in keys_to_release:
-        virtual_uinput.write(ecodes.EV_KEY, code, 0)
+        send_key(code, 0, f"force_release({reason})")
 
     virtual_uinput.syn()
 
@@ -575,7 +622,25 @@ def release_all_virtual_keys(reason: str) -> None:
     forwarded_modifier_keys.clear()
     suppressed_keyup_codes.clear()
     triggered_combo_keys.clear()
+    virtual_pressed_keys.clear()
 
+def release_stale_virtual_keys_if_idle() -> None:
+    if virtual_uinput is None:
+        return
+
+    if pressed_physical_keys:
+        return
+
+    if not virtual_pressed_keys:
+        return
+
+    if logger is not None:
+        logger.warning(
+            "idle safety release for stale virtual keys: %s",
+            [key_name(code) for code in sorted(virtual_pressed_keys)],
+        )
+
+    release_all_virtual_keys("idle_safety")
 
 def key_name(code: int) -> str:
     return ecodes.KEY.get(code, f"UNKNOWN_{code}")
@@ -584,6 +649,36 @@ def key_name(code: int) -> str:
 def value_name(value: int) -> str:
     return {0: "up", 1: "down", 2: "repeat"}.get(value, str(value))
 
+def debug_beep_for_key_event(code: int, value: int) -> None:
+    global last_debug_beep_time
+
+    if not DEBUG_BEEP_ON_KEY_EVENTS:
+        return
+
+    if logger is None or not logger.isEnabledFor(logging.DEBUG):
+        return
+
+    if value == 0:
+        return
+
+    if value == 2 and not DEBUG_BEEP_ON_REPEAT:
+        return
+
+    now = time.monotonic()
+    if now - last_debug_beep_time < 0.05:
+        return
+
+    last_debug_beep_time = now
+
+    try:
+        subprocess.Popen(
+            DEBUG_BEEP_COMMAND,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        pass
 
 def physical_modifiers() -> set[str]:
     active: set[str] = set()
@@ -591,6 +686,10 @@ def physical_modifiers() -> set[str]:
         if pressed_physical_keys & keycodes:
             active.add(modifier_name)
     return active
+
+
+def has_non_text_modifier() -> bool:
+    return bool(physical_modifiers() - {"S"})
 
 
 def state_snapshot() -> dict[str, Any]:
@@ -609,9 +708,30 @@ def state_snapshot() -> dict[str, Any]:
 # Output helpers
 # -----------------------------------------------------------------------------
 
-def write_key(code: int, value: int, reason: str) -> None:
-    logger.debug("emit key %-14s %-6s reason=%s", key_name(code), value_name(value), reason)
+def track_virtual_key_state(code: int, value: int) -> None:
+    if value == 1:
+        virtual_pressed_keys.add(code)
+    elif value == 0:
+        virtual_pressed_keys.discard(code)
+
+
+def send_key(code: int, value: int, reason: str) -> None:
+    track_virtual_key_state(code, value)
+
+    logger.debug(
+        "SEND key %-14s %-6s reason=%s virtual_pressed=%s physical_pressed=%s",
+        key_name(code),
+        value_name(value),
+        reason,
+        [key_name(item) for item in sorted(virtual_pressed_keys)],
+        [key_name(item) for item in sorted(pressed_physical_keys)],
+    )
+
     virtual_uinput.write(ecodes.EV_KEY, code, value)
+
+
+def write_key(code: int, value: int, reason: str) -> None:
+    send_key(code, value, reason)
 
 
 def sync(reason: str) -> None:
@@ -658,15 +778,20 @@ def type_char(ch: str) -> None:
     keycode, needs_shift = CHARMAP[ch]
     logger.debug("type_char ch=%r key=%s needs_shift=%s", ch, key_name(keycode), needs_shift)
 
-    if needs_shift:
-        write_key(ecodes.KEY_LEFTSHIFT, 1, f"type_char({ch}) shift_down")
-        sync(f"type_char({ch}) shift_down")
+    shift_pressed = False
 
-    tap(keycode, f"type_char({ch})")
+    try:
+        if needs_shift:
+            write_key(ecodes.KEY_LEFTSHIFT, 1, f"type_char({ch}) shift_down")
+            sync(f"type_char({ch}) shift_down")
+            shift_pressed = True
 
-    if needs_shift:
-        write_key(ecodes.KEY_LEFTSHIFT, 0, f"type_char({ch}) shift_up")
-        sync(f"type_char({ch}) shift_up")
+        tap(keycode, f"type_char({ch})")
+
+    finally:
+        if shift_pressed:
+            write_key(ecodes.KEY_LEFTSHIFT, 0, f"type_char({ch}) shift_up")
+            sync(f"type_char({ch}) shift_up")
 
 
 def type_text(text: str) -> None:
@@ -678,16 +803,35 @@ def type_text(text: str) -> None:
 
 def forward_event(event, reason: str, device_name: str) -> None:
     if event.type == ecodes.EV_KEY:
+        track_virtual_key_state(event.code, event.value)
+
         logger.debug(
-            "forward key %-14s %-6s dev=%s reason=%s state=%s",
+            "SEND forward key %-14s %-6s dev=%s reason=%s virtual_pressed=%s physical_pressed=%s state=%s",
             key_name(event.code),
             value_name(event.value),
             device_name,
             reason,
+            [key_name(item) for item in sorted(virtual_pressed_keys)],
+            [key_name(item) for item in sorted(pressed_physical_keys)],
             state_snapshot(),
         )
+
     virtual_uinput.write_event(event)
     virtual_uinput.syn()
+
+
+def create_virtual_uinput(devices: list[InputDevice]) -> UInput:
+    """Create the fixed-capability output device used by current and future inputs."""
+    capabilities: dict[int, set[Any]] = {}
+
+    for dev in devices:
+        for event_type, event_codes in dev.capabilities().items():
+            if event_type in (ecodes.EV_SYN, ecodes.EV_FF):
+                continue
+            capabilities.setdefault(event_type, set()).update(event_codes)
+
+    capabilities.setdefault(ecodes.EV_KEY, set()).update(NAVIGATION_KEYCODES)
+    return UInput(events=capabilities, name=KEYSWAP_UINPUT_NAME)
 
 
 # -----------------------------------------------------------------------------
@@ -699,24 +843,24 @@ def update_typed_buffer_from_keydown(code: int) -> None:
 
     if code == ecodes.KEY_BACKSPACE:
         typed_buffer = typed_buffer[:-1]
-        logger.info("typed_buffer=%r", typed_buffer)
+        logger.debug("typed_buffer=%r", typed_buffer)
         return
 
     if code == ecodes.KEY_TAB:
         typed_buffer += "\t"
         typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
-        logger.info("typed_buffer=%r", typed_buffer)
+        logger.debug("typed_buffer=%r", typed_buffer)
         return
 
     if code == ecodes.KEY_ENTER:
         typed_buffer += "\n"
         typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
-        logger.info("typed_buffer=%r", typed_buffer)
+        logger.debug("typed_buffer=%r", typed_buffer)
         return
 
     if code == ecodes.KEY_ESC:
         typed_buffer = ""
-        logger.info("typed_buffer=%r", typed_buffer)
+        logger.debug("typed_buffer=%r", typed_buffer)
         return
 
     if xkb_decoder is None:
@@ -726,7 +870,7 @@ def update_typed_buffer_from_keydown(code: int) -> None:
     if ch:
         typed_buffer += ch
         typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
-        logger.info("typed_buffer=%r", typed_buffer)
+        logger.debug("typed_buffer=%r", typed_buffer)
 
 
 def maybe_mark_pending_sequence(sequences: dict[str, str], last_code: int) -> bool:
@@ -791,7 +935,7 @@ def run_queued_sequence_if_any() -> bool:
 
     typed_buffer = typed_buffer[:-len(trigger)] + replacement
     typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
-    logger.info("typed_buffer=%r", typed_buffer)
+    logger.debug("typed_buffer=%r", typed_buffer)
 
     pending_sequence_run = None
     return True
@@ -819,6 +963,8 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
         state_snapshot(),
     )
 
+    debug_beep_for_key_event(code, value)
+
     if value == 1:  # key down
         pressed_physical_keys.add(code)
 
@@ -845,8 +991,18 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
             return
 
         forward_event(event, "normal_key_passthrough", device_name)
-        update_typed_buffer_from_keydown(code)
-        maybe_mark_pending_sequence(sequences, code)
+
+        if not has_non_text_modifier():
+            update_typed_buffer_from_keydown(code)
+            maybe_mark_pending_sequence(sequences, code)
+        else:
+            logger.debug(
+                "skip typed_buffer update because non-text modifier is active key=%s mods=%s state=%s",
+                key_name(code),
+                sorted(physical_modifiers()),
+                state_snapshot(),
+            )
+
         return
 
     if value == 0:  # key up
@@ -856,10 +1012,12 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
             xkb_decoder.update_key(code, False)
 
         if code in suppressed_keyup_codes:
+            logger.debug("suppress physical keyup key=%s state=%s", key_name(code), state_snapshot())
             suppressed_keyup_codes.discard(code)
             return
 
         if code in triggered_combo_keys:
+            logger.debug("suppress triggered combo keyup key=%s state=%s", key_name(code), state_snapshot())
             triggered_combo_keys.discard(code)
             return
 
@@ -871,10 +1029,26 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
         return
 
     if value == 2:  # repeat
+        logger.debug(
+            "repeat detected key=%s dev=%s state=%s",
+            key_name(code),
+            device_name,
+            state_snapshot(),
+        )
+
         if code in triggered_combo_keys:
             return
 
         forward_event(event, "repeat_passthrough", device_name)
+        return
+
+    logger.warning(
+        "unknown key value key=%s value=%s dev=%s state=%s",
+        key_name(code),
+        value,
+        device_name,
+        state_snapshot(),
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -1086,6 +1260,12 @@ def remove_polled_device(
     if dev is None:
         return
 
+    # A disappearing device may never deliver key-up events for keys that were
+    # held when it disconnected. Release the shared virtual state immediately;
+    # otherwise compositors such as Sway can consider that key held across the
+    # whole seat and suppress the same key from every attached keyboard.
+    release_all_virtual_keys(f"device_removed({getattr(dev, 'name', '?')})")
+
     open_devices = [item for item in open_devices if item.fd != fd]
 
     logger.warning(
@@ -1150,10 +1330,10 @@ def cleanup_and_exit(*_args) -> None:
 # -----------------------------------------------------------------------------
 
 def main() -> None:
-    global open_devices, virtual_uinput, logger, xkb_decoder
+    global open_devices, virtual_uinput, logger, xkb_decoder, last_poll_wakeup_time
 
-    config_path, verbose, dump_config = parse_args()
-    logger = setup_logging(verbose)
+    config_path, log_level, dump_config = parse_args()
+    logger = setup_logging(log_level)
     logger.info("using config: %s", config_path)
 
     device_selection, substitutions, sequences, xkb_config = load_config(config_path)
@@ -1183,7 +1363,7 @@ def main() -> None:
             ", ".join(f"{path} ({reason})" for path, reason in failures),
         )
 
-    virtual_uinput = UInput.from_device(*devices, name=KEYSWAP_UINPUT_NAME)
+    virtual_uinput = create_virtual_uinput(devices)
     release_all_virtual_keys("startup")
 
     signal.signal(signal.SIGINT, cleanup_and_exit)
@@ -1201,8 +1381,18 @@ def main() -> None:
         poller.register(input_dir_inotify_fd, select.POLLIN)
 
     while True:
-        poll_timeout = AUTO_POLL_TIMEOUT_MS if auto_discovery_enabled and input_dir_inotify_fd is None else None
+        poll_timeout = 100
         ready = poller.poll(poll_timeout)
+
+        now = time.monotonic()
+        if now - last_poll_wakeup_time > 5.0:
+            logger.warning(
+                "long poll gap detected gap=%.3fs; possible suspend/resume; state=%s",
+                now - last_poll_wakeup_time,
+                state_snapshot(),
+            )
+            release_all_virtual_keys("long_poll_gap_possible_resume")
+        last_poll_wakeup_time = now
 
         for fd, mask in ready:
             if input_dir_inotify_fd is not None and fd == input_dir_inotify_fd:
@@ -1279,6 +1469,8 @@ def main() -> None:
 
         if should_run_queued_sequence_now():
             run_queued_sequence_if_any()
+
+        release_stale_virtual_keys_if_idle()
 
 
 if __name__ == "__main__":
