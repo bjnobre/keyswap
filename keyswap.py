@@ -192,6 +192,8 @@ CHARMAP = {
     "X": (ecodes.KEY_X, True),
     "Y": (ecodes.KEY_Y, True),
     "Z": (ecodes.KEY_Z, True),
+    "ç": (ecodes.KEY_SEMICOLON, False),
+    "Ç": (ecodes.KEY_SEMICOLON, True),
     "0": (ecodes.KEY_0, False),
     "1": (ecodes.KEY_1, False),
     "2": (ecodes.KEY_2, False),
@@ -213,7 +215,8 @@ CHARMAP = {
     "/": (ecodes.KEY_RO, False),
     "?": (ecodes.KEY_RO, True),
     ";": (ecodes.KEY_SEMICOLON, False),
-    ":": (ecodes.KEY_SEMICOLON, True),
+    # Brazilian ABNT2: Shift+/ produces ':'; Shift+; produces 'Ç'.
+    ":": (ecodes.KEY_SLASH, True),
     "'": (ecodes.KEY_APOSTROPHE, False),
     '"': (ecodes.KEY_APOSTROPHE, True),
     "[": (ecodes.KEY_LEFTBRACE, False),
@@ -238,7 +241,36 @@ CHARMAP = {
     ")": (ecodes.KEY_0, True),
 }
 
+# Characters produced with an ABNT2 dead key followed by a base character.
+# Keep these separate from CHARMAP because each character requires two taps.
+ABNT2_DEAD_KEYS = {
+    "acute": (ecodes.KEY_LEFTBRACE, False),
+    "grave": (ecodes.KEY_LEFTBRACE, True),
+    "tilde": (ecodes.KEY_APOSTROPHE, False),
+    "circumflex": (ecodes.KEY_APOSTROPHE, True),
+    "diaeresis": (ecodes.KEY_6, True),
+}
+
+DEAD_KEY_CHARACTERS = {
+    "acute": ("áéíóúýÁÉÍÓÚÝ", "aeiouyAEIOUY"),
+    "grave": ("àèìòùÀÈÌÒÙ", "aeiouAEIOU"),
+    "tilde": ("ãẽĩõũñÃẼĨÕŨÑ", "aeiounAEIOUN"),
+    "circumflex": ("âêîôûÂÊÎÔÛ", "aeiouAEIOU"),
+    "diaeresis": ("äëïöüÿÄËÏÖÜŸ", "aeiouyAEIOUY"),
+}
+
+DEAD_KEY_CHARMAP: dict[str, tuple[tuple[int, bool], tuple[int, bool]]] = {}
+for accent_name, (accented_chars, base_chars) in DEAD_KEY_CHARACTERS.items():
+    dead_key = ABNT2_DEAD_KEYS[accent_name]
+    for accented_char, base_char in zip(accented_chars, base_chars):
+        DEAD_KEY_CHARMAP[accented_char] = (dead_key, CHARMAP[base_char])
+
 CHARMAP_KEYCODES = {keycode for keycode, _needs_shift in CHARMAP.values()}
+CHARMAP_KEYCODES.update(
+    keycode
+    for sequence in DEAD_KEY_CHARMAP.values()
+    for keycode, _needs_shift in sequence
+)
 
 # Uinput capabilities cannot be expanded after the virtual device is created.
 # Keep navigation keys available even when the keyboard that provides them is
@@ -772,26 +804,41 @@ def release_forwarded_modifiers() -> None:
 
 
 def type_char(ch: str) -> None:
+    if ch in DEAD_KEY_CHARMAP:
+        logger.debug("type_char ch=%r dead_key_sequence", ch)
+        for keycode, needs_shift in DEAD_KEY_CHARMAP[ch]:
+            type_keycode(keycode, needs_shift, ch)
+        return
+
     if ch not in CHARMAP:
         raise ValueError(f"unsupported output character: {ch!r}")
 
     keycode, needs_shift = CHARMAP[ch]
-    logger.debug("type_char ch=%r key=%s needs_shift=%s", ch, key_name(keycode), needs_shift)
+    type_keycode(keycode, needs_shift, ch)
+
+
+def type_keycode(keycode: int, needs_shift: bool, source_char: str) -> None:
+    logger.debug(
+        "type_char ch=%r key=%s needs_shift=%s",
+        source_char,
+        key_name(keycode),
+        needs_shift,
+    )
 
     shift_pressed = False
 
     try:
         if needs_shift:
-            write_key(ecodes.KEY_LEFTSHIFT, 1, f"type_char({ch}) shift_down")
-            sync(f"type_char({ch}) shift_down")
+            write_key(ecodes.KEY_LEFTSHIFT, 1, f"type_char({source_char}) shift_down")
+            sync(f"type_char({source_char}) shift_down")
             shift_pressed = True
 
-        tap(keycode, f"type_char({ch})")
+        tap(keycode, f"type_char({source_char})")
 
     finally:
         if shift_pressed:
-            write_key(ecodes.KEY_LEFTSHIFT, 0, f"type_char({ch}) shift_up")
-            sync(f"type_char({ch}) shift_up")
+            write_key(ecodes.KEY_LEFTSHIFT, 0, f"type_char({source_char}) shift_up")
+            sync(f"type_char({source_char}) shift_up")
 
 
 def type_text(text: str) -> None:
