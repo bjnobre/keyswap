@@ -1,6 +1,8 @@
 import importlib.util
 import io
+import json
 import logging
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,14 +50,14 @@ class KeyRepeatTests(unittest.TestCase):
     def handle(self, value):
         keyswap.handle_key_event(self.event(value), "test keyboard", {}, {})
 
-    def test_physical_repeat_is_suppressed_after_matching_keydown(self):
+    def test_valid_physical_repeat_is_forwarded_after_matching_keydown(self):
         self.handle(1)
         self.handle(2)
         self.handle(0)
 
         self.assertEqual(
             [value for _type, _code, value in keyswap.virtual_uinput.events],
-            [1, 0],
+            [1, 2, 0],
         )
 
     def test_orphan_repeat_is_suppressed(self):
@@ -139,6 +141,38 @@ class BugTracePrivacyTests(unittest.TestCase):
         self.assertIs(snapshot["pending_sequence_match"], True)
         self.assertNotIn("private", repr(snapshot))
         self.assertNotIn("secret", repr(snapshot))
+
+
+class SequenceBufferTests(unittest.TestCase):
+    def test_sequence_buffer_limit_is_twenty_characters(self):
+        self.assertEqual(keyswap.SEQUENCE_BUFFER_MAX_CHARS, 20)
+
+    def test_config_rejects_trigger_longer_than_sequence_buffer(self):
+        config = {
+            "devices": "auto",
+            "substitutions": {},
+            "sequences": {"x" * 21: "replacement"},
+        }
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as handle:
+            json.dump(config, handle)
+            handle.flush()
+            with self.assertRaisesRegex(ValueError, "20-character limit"):
+                keyswap.load_config(Path(handle.name))
+
+    def test_typed_buffer_is_trimmed_to_twenty_characters(self):
+        original_buffer = keyswap.typed_buffer
+        original_decoder = keyswap.xkb_decoder
+        try:
+            keyswap.typed_buffer = ""
+            keyswap.xkb_decoder = SimpleNamespace(char_for_keydown=lambda _code: "x")
+            for _ in range(25):
+                keyswap.update_typed_buffer_from_keydown(ecodes.KEY_X)
+            result = keyswap.typed_buffer
+        finally:
+            keyswap.typed_buffer = original_buffer
+            keyswap.xkb_decoder = original_decoder
+
+        self.assertEqual(result, "x" * 20)
 
 
 if __name__ == "__main__":

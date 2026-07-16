@@ -86,6 +86,7 @@ PSEUDO_KEYBOARD_NAMES = {
 SEQUENCE_BACKSPACE_SETTLE_MS = 10
 TYPE_CHAR_DELAY_MS = 5
 BACKSPACE_DELAY_MS = 1
+SEQUENCE_BUFFER_MAX_CHARS = 20
 
 # Keep a quiet, bounded history of key traffic. It is only written to the
 # journal when an anomalous state is detected, giving intermittent keyboard
@@ -308,7 +309,6 @@ last_debug_beep_time = 0.0
 last_poll_wakeup_time = time.monotonic()
 
 typed_buffer = ""
-max_sequence_len = 0
 
 pending_sequence_match: dict[str, Any] | None = None
 pending_sequence_run: dict[str, Any] | None = None
@@ -535,8 +535,6 @@ def parse_combo(combo: str) -> tuple[set[str], int]:
 
 
 def load_config(config_path: Path) -> tuple[DeviceSelection, dict, dict, dict]:
-    global max_sequence_len
-
     with open(config_path, "r", encoding="utf-8") as handle:
         raw = json.load(handle)
 
@@ -574,12 +572,19 @@ def load_config(config_path: Path) -> tuple[DeviceSelection, dict, dict, dict]:
     sequences = raw.get("sequences", {})
     if not isinstance(sequences, dict):
         raise ValueError("'sequences' must be an object/map")
+    for trigger in sequences:
+        if not isinstance(trigger, str) or not trigger:
+            raise ValueError("sequence triggers must be non-empty strings")
+        if len(trigger) > SEQUENCE_BUFFER_MAX_CHARS:
+            raise ValueError(
+                f"sequence trigger {trigger!r} exceeds the "
+                f"{SEQUENCE_BUFFER_MAX_CHARS}-character limit"
+            )
 
     xkb_config = raw.get("xkb", {})
     if not isinstance(xkb_config, dict):
         raise ValueError("'xkb' must be an object/map when present")
 
-    max_sequence_len = max((len(trigger) for trigger in sequences), default=0)
     return device_selection, substitutions, sequences, xkb_config
 
 
@@ -979,13 +984,13 @@ def update_typed_buffer_from_keydown(code: int) -> None:
 
     if code == ecodes.KEY_TAB:
         typed_buffer += "\t"
-        typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
+        typed_buffer = typed_buffer[-SEQUENCE_BUFFER_MAX_CHARS:]
         logger.debug("typed_buffer=%r", typed_buffer)
         return
 
     if code == ecodes.KEY_ENTER:
         typed_buffer += "\n"
-        typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
+        typed_buffer = typed_buffer[-SEQUENCE_BUFFER_MAX_CHARS:]
         logger.debug("typed_buffer=%r", typed_buffer)
         return
 
@@ -1000,7 +1005,7 @@ def update_typed_buffer_from_keydown(code: int) -> None:
     ch = xkb_decoder.char_for_keydown(code)
     if ch:
         typed_buffer += ch
-        typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
+        typed_buffer = typed_buffer[-SEQUENCE_BUFFER_MAX_CHARS:]
         logger.debug("typed_buffer=%r", typed_buffer)
 
 
@@ -1065,7 +1070,7 @@ def run_queued_sequence_if_any() -> bool:
     type_text(replacement)
 
     typed_buffer = typed_buffer[:-len(trigger)] + replacement
-    typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
+    typed_buffer = typed_buffer[-SEQUENCE_BUFFER_MAX_CHARS:]
     logger.debug("typed_buffer=%r", typed_buffer)
 
     pending_sequence_run = None
@@ -1195,15 +1200,11 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
                 reported_orphan_repeat_codes.add(code)
             return
 
-        # Sway starts its own repeat timer from the forwarded key-down and stops
-        # it on key-up. Forwarding the physical device's value=2 packets adds a
-        # second, unnecessary repeat stream and lets a flaky wireless keyboard
-        # flood applications immediately before it disconnects.
-        logger.debug(
-            "suppress physical repeat; compositor owns repeat key=%s dev=%s",
-            key_name(code),
-            device_name,
-        )
+        # Valid repeats still need to reach the virtual keyboard. In practice,
+        # applications and compositor paths do not all synthesize repeats from
+        # the initial key-down, notably for held navigation keys. Orphan repeats
+        # remain blocked above after disconnect/recovery state has been cleared.
+        forward_event(event, "repeat_passthrough", device_name)
         return
 
     logger.warning(
