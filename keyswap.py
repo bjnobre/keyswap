@@ -27,6 +27,7 @@ import signal
 import sys
 import time
 import subprocess
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +86,12 @@ PSEUDO_KEYBOARD_NAMES = {
 SEQUENCE_BACKSPACE_SETTLE_MS = 10
 TYPE_CHAR_DELAY_MS = 5
 BACKSPACE_DELAY_MS = 1
+SEQUENCE_BUFFER_MAX_CHARS = 20
+
+# Keep a quiet, bounded history of key traffic. It is only written to the
+# journal when an anomalous state is detected, giving intermittent keyboard
+# bugs useful context without enabling per-key debug logging all the time.
+BUG_TRACE_MAX_EVENTS = 80
 
 # XKB constants.
 XKB_CONTEXT_NO_FLAGS = 0
@@ -295,12 +302,12 @@ forwarded_modifier_keys: set[int] = set()
 suppressed_keyup_codes: set[int] = set()
 triggered_combo_keys: set[int] = set()
 virtual_pressed_keys: set[int] = set()
+bug_trace: deque[dict[str, Any]] = deque(maxlen=BUG_TRACE_MAX_EVENTS)
 
 last_debug_beep_time = 0.0
 last_poll_wakeup_time = time.monotonic()
 
 typed_buffer = ""
-max_sequence_len = 0
 
 pending_sequence_match: dict[str, Any] | None = None
 pending_sequence_run: dict[str, Any] | None = None
@@ -527,8 +534,6 @@ def parse_combo(combo: str) -> tuple[set[str], int]:
 
 
 def load_config(config_path: Path) -> tuple[DeviceSelection, dict, dict, dict]:
-    global max_sequence_len
-
     with open(config_path, "r", encoding="utf-8") as handle:
         raw = json.load(handle)
 
@@ -566,12 +571,19 @@ def load_config(config_path: Path) -> tuple[DeviceSelection, dict, dict, dict]:
     sequences = raw.get("sequences", {})
     if not isinstance(sequences, dict):
         raise ValueError("'sequences' must be an object/map")
+    for trigger in sequences:
+        if not isinstance(trigger, str) or not trigger:
+            raise ValueError("sequence triggers must be non-empty strings")
+        if len(trigger) > SEQUENCE_BUFFER_MAX_CHARS:
+            raise ValueError(
+                f"sequence trigger {trigger!r} exceeds the "
+                f"{SEQUENCE_BUFFER_MAX_CHARS}-character limit"
+            )
 
     xkb_config = raw.get("xkb", {})
     if not isinstance(xkb_config, dict):
         raise ValueError("'xkb' must be an object/map when present")
 
-    max_sequence_len = max((len(trigger) for trigger in sequences), default=0)
     return device_selection, substitutions, sequences, xkb_config
 
 
@@ -607,6 +619,51 @@ def dump_loaded_config(
 # -----------------------------------------------------------------------------
 # State helpers
 # -----------------------------------------------------------------------------
+def record_bug_trace(
+    direction: str,
+    code: int,
+    value: int,
+    *,
+    device_name: str | None = None,
+    reason: str | None = None,
+) -> None:
+    """Record key metadata only; never record decoded or substituted text."""
+    item: dict[str, Any] = {
+        "age_clock": round(time.monotonic(), 6),
+        "direction": direction,
+        "key": diagnostic_key_name(code),
+        "value": value_name(value),
+    }
+    if device_name is not None:
+        item["device"] = device_name
+    if reason is not None:
+        item["reason"] = reason
+    bug_trace.append(item)
+
+
+def dump_bug_context(reason: str, **details: Any) -> None:
+    """Flush the recent key flight recorder to the persistent service journal."""
+    if logger is None:
+        bug_trace.clear()
+        return
+
+    now = time.monotonic()
+    events = []
+    for item in bug_trace:
+        event = dict(item)
+        event["age_ms"] = round((now - event.pop("age_clock")) * 1000)
+        events.append(event)
+
+    logger.warning(
+        "BUG_CONTEXT reason=%s details=%s state=%s recent_events=%s",
+        reason,
+        details,
+        diagnostic_state_snapshot(),
+        events,
+    )
+    bug_trace.clear()
+
+
 def release_all_virtual_keys(reason: str) -> None:
     global pressed_physical_keys
     global forwarded_modifier_keys
@@ -616,6 +673,9 @@ def release_all_virtual_keys(reason: str) -> None:
 
     if virtual_uinput is None:
         return
+
+    if reason not in {"startup", "shutdown"}:
+        dump_bug_context(reason)
 
     keys_to_release = sorted({
         *ALL_MODIFIER_KEYS,
@@ -678,6 +738,14 @@ def key_name(code: int) -> str:
     return ecodes.KEY.get(code, f"UNKNOWN_{code}")
 
 
+def diagnostic_key_name(code: int) -> str:
+    # A journal is persistent and may be included in bug reports. Preserve the
+    # keys relevant to state bugs, but do not leave reconstructable typed text.
+    if code in CHARMAP_KEYCODES:
+        return "<text-key>"
+    return key_name(code)
+
+
 def value_name(value: int) -> str:
     return {0: "up", 1: "down", 2: "repeat"}.get(value, str(value))
 
@@ -736,6 +804,14 @@ def state_snapshot() -> dict[str, Any]:
     }
 
 
+def diagnostic_state_snapshot() -> dict[str, Any]:
+    """Return persistent-log-safe state without typed or replacement text."""
+    snapshot = state_snapshot()
+    snapshot["typed_buffer"] = f"<redacted length={len(typed_buffer)}>"
+    snapshot["pending_sequence_match"] = pending_sequence_match is not None
+    return snapshot
+
+
 # -----------------------------------------------------------------------------
 # Output helpers
 # -----------------------------------------------------------------------------
@@ -748,6 +824,7 @@ def track_virtual_key_state(code: int, value: int) -> None:
 
 
 def send_key(code: int, value: int, reason: str) -> None:
+    record_bug_trace("out", code, value, reason=reason)
     track_virtual_key_state(code, value)
 
     logger.debug(
@@ -850,6 +927,13 @@ def type_text(text: str) -> None:
 
 def forward_event(event, reason: str, device_name: str) -> None:
     if event.type == ecodes.EV_KEY:
+        record_bug_trace(
+            "out",
+            event.code,
+            event.value,
+            device_name=device_name,
+            reason=reason,
+        )
         track_virtual_key_state(event.code, event.value)
 
         logger.debug(
@@ -895,13 +979,13 @@ def update_typed_buffer_from_keydown(code: int) -> None:
 
     if code == ecodes.KEY_TAB:
         typed_buffer += "\t"
-        typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
+        typed_buffer = typed_buffer[-SEQUENCE_BUFFER_MAX_CHARS:]
         logger.debug("typed_buffer=%r", typed_buffer)
         return
 
     if code == ecodes.KEY_ENTER:
         typed_buffer += "\n"
-        typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
+        typed_buffer = typed_buffer[-SEQUENCE_BUFFER_MAX_CHARS:]
         logger.debug("typed_buffer=%r", typed_buffer)
         return
 
@@ -916,7 +1000,7 @@ def update_typed_buffer_from_keydown(code: int) -> None:
     ch = xkb_decoder.char_for_keydown(code)
     if ch:
         typed_buffer += ch
-        typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
+        typed_buffer = typed_buffer[-SEQUENCE_BUFFER_MAX_CHARS:]
         logger.debug("typed_buffer=%r", typed_buffer)
 
 
@@ -981,7 +1065,7 @@ def run_queued_sequence_if_any() -> bool:
     type_text(replacement)
 
     typed_buffer = typed_buffer[:-len(trigger)] + replacement
-    typed_buffer = typed_buffer[-max(max_sequence_len, 200):]
+    typed_buffer = typed_buffer[-SEQUENCE_BUFFER_MAX_CHARS:]
     logger.debug("typed_buffer=%r", typed_buffer)
 
     pending_sequence_run = None
@@ -1001,6 +1085,7 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
 
     code = event.code
     value = event.value
+    record_bug_trace("in", code, value, device_name=device_name)
 
     logger.debug(
         "physical key %-14s %-6s dev=%s before_state=%s",

@@ -92,6 +92,17 @@ journalctl --user -u keyswap.service -f
 For full per-key diagnostics, use `--log-level debug` (or its `--verbose`
 alias). For errors and unusual conditions only, use `--log-level warning`.
 
+Keyswap also keeps a quiet, in-memory flight recorder of the 80 most recent
+input and output key transitions. When it detects a disconnect, stale virtual
+key state, suspend/resume gap, or orphan repeat, it writes that context to the
+service journal as a `BUG_CONTEXT` warning. Ordinary text keys are redacted;
+navigation keys, modifiers, device names, event direction, and timing remain
+visible. To retrieve captured incidents:
+
+```bash
+journalctl --user -u keyswap.service -g BUG_CONTEXT
+```
+
 ---
 
 ## License
