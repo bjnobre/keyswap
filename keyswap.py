@@ -302,7 +302,6 @@ forwarded_modifier_keys: set[int] = set()
 suppressed_keyup_codes: set[int] = set()
 triggered_combo_keys: set[int] = set()
 virtual_pressed_keys: set[int] = set()
-reported_orphan_repeat_codes: set[int] = set()
 bug_trace: deque[dict[str, Any]] = deque(maxlen=BUG_TRACE_MAX_EVENTS)
 
 last_debug_beep_time = 0.0
@@ -671,7 +670,6 @@ def release_all_virtual_keys(reason: str) -> None:
     global suppressed_keyup_codes
     global triggered_combo_keys
     global virtual_pressed_keys
-    global reported_orphan_repeat_codes
 
     if virtual_uinput is None:
         return
@@ -717,7 +715,6 @@ def release_all_virtual_keys(reason: str) -> None:
     suppressed_keyup_codes.clear()
     triggered_combo_keys.clear()
     virtual_pressed_keys.clear()
-    reported_orphan_repeat_codes.clear()
 
 def release_stale_virtual_keys_if_idle() -> None:
     if virtual_uinput is None:
@@ -960,9 +957,7 @@ def create_virtual_uinput(devices: list[InputDevice]) -> UInput:
 
     for dev in devices:
         for event_type, event_codes in dev.capabilities().items():
-            # Sway owns the repeat timer for forwarded key-downs. Do not create
-            # a kernel repeat timer on the virtual device as a second source.
-            if event_type in (ecodes.EV_SYN, ecodes.EV_FF, ecodes.EV_REP):
+            if event_type in (ecodes.EV_SYN, ecodes.EV_FF):
                 continue
             capabilities.setdefault(event_type, set()).update(event_codes)
 
@@ -1104,7 +1099,6 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
 
     if value == 1:  # key down
         pressed_physical_keys.add(code)
-        reported_orphan_repeat_codes.discard(code)
 
         if xkb_decoder is not None:
             xkb_decoder.update_key(code, True)
@@ -1145,7 +1139,6 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
 
     if value == 0:  # key up
         pressed_physical_keys.discard(code)
-        reported_orphan_repeat_codes.discard(code)
 
         if xkb_decoder is not None:
             xkb_decoder.update_key(code, False)
@@ -1178,32 +1171,6 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
         if code in triggered_combo_keys:
             return
 
-        # A repeat is only valid while the corresponding physical key-down is
-        # still active and has a pressed key on the virtual device.  Device
-        # removal and suspend recovery deliberately release and clear all key
-        # state; some keyboards can still leave already-queued repeat packets
-        # behind.  Forwarding those orphan repeats makes applications receive
-        # an apparently stuck key with no new key-down.
-        if code not in pressed_physical_keys or code not in virtual_pressed_keys:
-            if code not in reported_orphan_repeat_codes:
-                dump_bug_context(
-                    "orphan_repeat",
-                    device=device_name,
-                    key=diagnostic_key_name(code),
-                )
-                logger.warning(
-                    "suppress orphan repeat key=%s dev=%s state=%s",
-                    key_name(code),
-                    device_name,
-                    state_snapshot(),
-                )
-                reported_orphan_repeat_codes.add(code)
-            return
-
-        # Valid repeats still need to reach the virtual keyboard. In practice,
-        # applications and compositor paths do not all synthesize repeats from
-        # the initial key-down, notably for held navigation keys. Orphan repeats
-        # remain blocked above after disconnect/recovery state has been cleared.
         forward_event(event, "repeat_passthrough", device_name)
         return
 

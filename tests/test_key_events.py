@@ -40,7 +40,6 @@ class KeyRepeatTests(unittest.TestCase):
         keyswap.suppressed_keyup_codes.clear()
         keyswap.triggered_combo_keys.clear()
         keyswap.virtual_pressed_keys.clear()
-        keyswap.reported_orphan_repeat_codes.clear()
         keyswap.bug_trace.clear()
 
     @staticmethod
@@ -60,13 +59,15 @@ class KeyRepeatTests(unittest.TestCase):
             [1, 2, 0],
         )
 
-    def test_orphan_repeat_is_suppressed(self):
+    def test_repeat_without_tracked_keydown_uses_original_passthrough_behavior(self):
         self.handle(2)
 
-        self.assertEqual(keyswap.virtual_uinput.events, [])
-        self.assertEqual(keyswap.virtual_uinput.syncs, 0)
+        self.assertEqual(
+            [value for _type, _code, value in keyswap.virtual_uinput.events],
+            [2],
+        )
 
-    def test_repeat_after_forced_state_clear_is_suppressed(self):
+    def test_repeat_after_state_clear_uses_original_passthrough_behavior(self):
         self.handle(1)
         keyswap.pressed_physical_keys.clear()
         keyswap.virtual_pressed_keys.clear()
@@ -75,31 +76,29 @@ class KeyRepeatTests(unittest.TestCase):
 
         self.assertEqual(
             [value for _type, _code, value in keyswap.virtual_uinput.events],
-            [1],
+            [1, 2],
         )
 
-    def test_orphan_repeat_dumps_recent_key_flight_recorder(self):
+    def test_incident_dump_includes_recent_key_flight_recorder(self):
         stream = io.StringIO()
         handler = logging.StreamHandler(stream)
         keyswap.logger.addHandler(handler)
         keyswap.logger.setLevel(logging.WARNING)
         try:
             self.handle(1)
-            keyswap.pressed_physical_keys.clear()
-            keyswap.virtual_pressed_keys.clear()
-            self.handle(2)
+            keyswap.dump_bug_context("test_incident", device="test keyboard")
         finally:
             keyswap.logger.removeHandler(handler)
 
         output = stream.getvalue()
-        self.assertIn("BUG_CONTEXT reason=orphan_repeat", output)
+        self.assertIn("BUG_CONTEXT reason=test_incident", output)
         self.assertIn("<text-key>", output)
         self.assertIn("recent_events=", output)
         self.assertEqual(list(keyswap.bug_trace), [])
 
 
 class VirtualDeviceCapabilityTests(unittest.TestCase):
-    def test_virtual_device_does_not_enable_a_second_repeat_source(self):
+    def test_virtual_device_preserves_physical_repeat_capability(self):
         physical_device = SimpleNamespace(
             capabilities=lambda: {
                 ecodes.EV_SYN: [ecodes.SYN_REPORT],
@@ -113,7 +112,7 @@ class VirtualDeviceCapabilityTests(unittest.TestCase):
 
         capabilities = uinput.call_args.kwargs["events"]
         self.assertNotIn(ecodes.EV_SYN, capabilities)
-        self.assertNotIn(ecodes.EV_REP, capabilities)
+        self.assertIn(ecodes.EV_REP, capabilities)
         self.assertIn(ecodes.KEY_A, capabilities[ecodes.EV_KEY])
 
 
