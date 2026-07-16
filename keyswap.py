@@ -27,6 +27,7 @@ import signal
 import sys
 import time
 import subprocess
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +86,11 @@ PSEUDO_KEYBOARD_NAMES = {
 SEQUENCE_BACKSPACE_SETTLE_MS = 10
 TYPE_CHAR_DELAY_MS = 5
 BACKSPACE_DELAY_MS = 1
+
+# Keep a quiet, bounded history of key traffic. It is only written to the
+# journal when an anomalous state is detected, giving intermittent keyboard
+# bugs useful context without enabling per-key debug logging all the time.
+BUG_TRACE_MAX_EVENTS = 80
 
 # XKB constants.
 XKB_CONTEXT_NO_FLAGS = 0
@@ -295,6 +301,8 @@ forwarded_modifier_keys: set[int] = set()
 suppressed_keyup_codes: set[int] = set()
 triggered_combo_keys: set[int] = set()
 virtual_pressed_keys: set[int] = set()
+reported_orphan_repeat_codes: set[int] = set()
+bug_trace: deque[dict[str, Any]] = deque(maxlen=BUG_TRACE_MAX_EVENTS)
 
 last_debug_beep_time = 0.0
 last_poll_wakeup_time = time.monotonic()
@@ -607,15 +615,64 @@ def dump_loaded_config(
 # -----------------------------------------------------------------------------
 # State helpers
 # -----------------------------------------------------------------------------
+def record_bug_trace(
+    direction: str,
+    code: int,
+    value: int,
+    *,
+    device_name: str | None = None,
+    reason: str | None = None,
+) -> None:
+    """Record key metadata only; never record decoded or substituted text."""
+    item: dict[str, Any] = {
+        "age_clock": round(time.monotonic(), 6),
+        "direction": direction,
+        "key": diagnostic_key_name(code),
+        "value": value_name(value),
+    }
+    if device_name is not None:
+        item["device"] = device_name
+    if reason is not None:
+        item["reason"] = reason
+    bug_trace.append(item)
+
+
+def dump_bug_context(reason: str, **details: Any) -> None:
+    """Flush the recent key flight recorder to the persistent service journal."""
+    if logger is None:
+        bug_trace.clear()
+        return
+
+    now = time.monotonic()
+    events = []
+    for item in bug_trace:
+        event = dict(item)
+        event["age_ms"] = round((now - event.pop("age_clock")) * 1000)
+        events.append(event)
+
+    logger.warning(
+        "BUG_CONTEXT reason=%s details=%s state=%s recent_events=%s",
+        reason,
+        details,
+        diagnostic_state_snapshot(),
+        events,
+    )
+    bug_trace.clear()
+
+
 def release_all_virtual_keys(reason: str) -> None:
     global pressed_physical_keys
     global forwarded_modifier_keys
     global suppressed_keyup_codes
     global triggered_combo_keys
     global virtual_pressed_keys
+    global reported_orphan_repeat_codes
 
     if virtual_uinput is None:
         return
+
+    if reason not in {"startup", "shutdown"}:
+        dump_bug_context(reason)
 
     keys_to_release = sorted({
         *ALL_MODIFIER_KEYS,
@@ -655,6 +712,7 @@ def release_all_virtual_keys(reason: str) -> None:
     suppressed_keyup_codes.clear()
     triggered_combo_keys.clear()
     virtual_pressed_keys.clear()
+    reported_orphan_repeat_codes.clear()
 
 def release_stale_virtual_keys_if_idle() -> None:
     if virtual_uinput is None:
@@ -676,6 +734,14 @@ def release_stale_virtual_keys_if_idle() -> None:
 
 def key_name(code: int) -> str:
     return ecodes.KEY.get(code, f"UNKNOWN_{code}")
+
+
+def diagnostic_key_name(code: int) -> str:
+    # A journal is persistent and may be included in bug reports. Preserve the
+    # keys relevant to state bugs, but do not leave reconstructable typed text.
+    if code in CHARMAP_KEYCODES:
+        return "<text-key>"
+    return key_name(code)
 
 
 def value_name(value: int) -> str:
@@ -736,6 +802,14 @@ def state_snapshot() -> dict[str, Any]:
     }
 
 
+def diagnostic_state_snapshot() -> dict[str, Any]:
+    """Return persistent-log-safe state without typed or replacement text."""
+    snapshot = state_snapshot()
+    snapshot["typed_buffer"] = f"<redacted length={len(typed_buffer)}>"
+    snapshot["pending_sequence_match"] = pending_sequence_match is not None
+    return snapshot
+
+
 # -----------------------------------------------------------------------------
 # Output helpers
 # -----------------------------------------------------------------------------
@@ -748,6 +822,7 @@ def track_virtual_key_state(code: int, value: int) -> None:
 
 
 def send_key(code: int, value: int, reason: str) -> None:
+    record_bug_trace("out", code, value, reason=reason)
     track_virtual_key_state(code, value)
 
     logger.debug(
@@ -850,6 +925,13 @@ def type_text(text: str) -> None:
 
 def forward_event(event, reason: str, device_name: str) -> None:
     if event.type == ecodes.EV_KEY:
+        record_bug_trace(
+            "out",
+            event.code,
+            event.value,
+            device_name=device_name,
+            reason=reason,
+        )
         track_virtual_key_state(event.code, event.value)
 
         logger.debug(
@@ -873,7 +955,9 @@ def create_virtual_uinput(devices: list[InputDevice]) -> UInput:
 
     for dev in devices:
         for event_type, event_codes in dev.capabilities().items():
-            if event_type in (ecodes.EV_SYN, ecodes.EV_FF):
+            # Sway owns the repeat timer for forwarded key-downs. Do not create
+            # a kernel repeat timer on the virtual device as a second source.
+            if event_type in (ecodes.EV_SYN, ecodes.EV_FF, ecodes.EV_REP):
                 continue
             capabilities.setdefault(event_type, set()).update(event_codes)
 
@@ -1001,6 +1085,7 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
 
     code = event.code
     value = event.value
+    record_bug_trace("in", code, value, device_name=device_name)
 
     logger.debug(
         "physical key %-14s %-6s dev=%s before_state=%s",
@@ -1014,6 +1099,7 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
 
     if value == 1:  # key down
         pressed_physical_keys.add(code)
+        reported_orphan_repeat_codes.discard(code)
 
         if xkb_decoder is not None:
             xkb_decoder.update_key(code, True)
@@ -1054,6 +1140,7 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
 
     if value == 0:  # key up
         pressed_physical_keys.discard(code)
+        reported_orphan_repeat_codes.discard(code)
 
         if xkb_decoder is not None:
             xkb_decoder.update_key(code, False)
@@ -1086,7 +1173,37 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
         if code in triggered_combo_keys:
             return
 
-        forward_event(event, "repeat_passthrough", device_name)
+        # A repeat is only valid while the corresponding physical key-down is
+        # still active and has a pressed key on the virtual device.  Device
+        # removal and suspend recovery deliberately release and clear all key
+        # state; some keyboards can still leave already-queued repeat packets
+        # behind.  Forwarding those orphan repeats makes applications receive
+        # an apparently stuck key with no new key-down.
+        if code not in pressed_physical_keys or code not in virtual_pressed_keys:
+            if code not in reported_orphan_repeat_codes:
+                dump_bug_context(
+                    "orphan_repeat",
+                    device=device_name,
+                    key=diagnostic_key_name(code),
+                )
+                logger.warning(
+                    "suppress orphan repeat key=%s dev=%s state=%s",
+                    key_name(code),
+                    device_name,
+                    state_snapshot(),
+                )
+                reported_orphan_repeat_codes.add(code)
+            return
+
+        # Sway starts its own repeat timer from the forwarded key-down and stops
+        # it on key-up. Forwarding the physical device's value=2 packets adds a
+        # second, unnecessary repeat stream and lets a flaky wireless keyboard
+        # flood applications immediately before it disconnects.
+        logger.debug(
+            "suppress physical repeat; compositor owns repeat key=%s dev=%s",
+            key_name(code),
+            device_name,
+        )
         return
 
     logger.warning(
