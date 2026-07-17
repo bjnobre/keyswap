@@ -28,6 +28,7 @@ import sys
 import time
 import subprocess
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -297,10 +298,17 @@ NAVIGATION_KEYCODES = {
 # Runtime mutable state
 # -----------------------------------------------------------------------------
 
-pressed_physical_keys: set[int] = set()
-forwarded_modifier_keys: set[int] = set()
-suppressed_keyup_codes: set[int] = set()
-triggered_combo_keys: set[int] = set()
+@dataclass
+class DeviceKeyState:
+    pressed: set[int] = field(default_factory=set)
+    forwarded_modifiers: set[int] = field(default_factory=set)
+    suppressed_keyups: set[int] = field(default_factory=set)
+    triggered_combo_keys: set[int] = field(default_factory=set)
+    reported_orphan_repeats: set[int] = field(default_factory=set)
+
+
+device_states: dict[str, DeviceKeyState] = {}
+virtual_key_owners: dict[int, set[str]] = {}
 virtual_pressed_keys: set[int] = set()
 bug_trace: deque[dict[str, Any]] = deque(maxlen=BUG_TRACE_MAX_EVENTS)
 
@@ -439,6 +447,18 @@ class XKBDecoder:
             return None
         text = buf.value.decode("utf-8", errors="ignore")
         return text or None
+
+    def reset_keys(self, pressed_keycodes: set[int] | None = None) -> None:
+        """Rebuild transient XKB key state after device loss or resume."""
+        new_state = self.lib.xkb_state_new(self.keymap)
+        if not new_state:
+            raise RuntimeError("failed to reset xkb state")
+        old_state = self.state
+        self.state = new_state
+        if old_state:
+            self.lib.xkb_state_unref(old_state)
+        for code in sorted(pressed_keycodes or set()):
+            self.update_key(code, True)
 
     def close(self) -> None:
         if getattr(self, "state", None):
@@ -664,13 +684,67 @@ def dump_bug_context(reason: str, **details: Any) -> None:
     bug_trace.clear()
 
 
-def release_all_virtual_keys(reason: str) -> None:
-    global pressed_physical_keys
-    global forwarded_modifier_keys
-    global suppressed_keyup_codes
-    global triggered_combo_keys
-    global virtual_pressed_keys
+def all_pressed_physical_keys() -> set[int]:
+    return set().union(*(state.pressed for state in device_states.values())) if device_states else set()
 
+
+def all_state_codes(attribute: str) -> set[int]:
+    return (
+        set().union(*(getattr(state, attribute) for state in device_states.values()))
+        if device_states
+        else set()
+    )
+
+
+def is_physically_pressed(code: int) -> bool:
+    return any(code in state.pressed for state in device_states.values())
+
+
+def reset_transient_text_state(reason: str) -> None:
+    global typed_buffer, pending_sequence_match, pending_sequence_run
+
+    typed_buffer = ""
+    pending_sequence_match = None
+    pending_sequence_run = None
+    if xkb_decoder is not None:
+        xkb_decoder.reset_keys(all_pressed_physical_keys())
+    if logger is not None:
+        logger.debug("reset transient text/xkb state reason=%s", reason)
+
+
+def release_device_keys(device_id: str, reason: str) -> None:
+    """Remove one physical device without disturbing keys owned by others."""
+    state = device_states.get(device_id)
+    if state is None:
+        return
+
+    dump_bug_context(reason, device_id=device_id)
+    released: list[int] = []
+    for code, owners in list(virtual_key_owners.items()):
+        if device_id not in owners:
+            continue
+        owners.discard(device_id)
+        if owners:
+            continue
+        virtual_key_owners.pop(code, None)
+        write_key(code, 0, f"device_release({reason})")
+        released.append(code)
+
+    if released:
+        sync(f"device_release({reason})")
+
+    device_states.pop(device_id, None)
+    reset_transient_text_state(reason)
+    if logger is not None:
+        logger.warning(
+            "released removed device state device_id=%s keys=%s remaining_devices=%s",
+            device_id,
+            [key_name(code) for code in released],
+            sorted(device_states),
+        )
+
+
+def release_all_virtual_keys(reason: str) -> None:
     if virtual_uinput is None:
         return
 
@@ -680,10 +754,10 @@ def release_all_virtual_keys(reason: str) -> None:
     keys_to_release = sorted({
         *ALL_MODIFIER_KEYS,
         *CHARMAP_KEYCODES,
-        *pressed_physical_keys,
-        *forwarded_modifier_keys,
-        *suppressed_keyup_codes,
-        *triggered_combo_keys,
+        *all_pressed_physical_keys(),
+        *all_state_codes("forwarded_modifiers"),
+        *all_state_codes("suppressed_keyups"),
+        *all_state_codes("triggered_combo_keys"),
         *virtual_pressed_keys,
         ecodes.KEY_UP,
         ecodes.KEY_DOWN,
@@ -710,17 +784,16 @@ def release_all_virtual_keys(reason: str) -> None:
 
     virtual_uinput.syn()
 
-    pressed_physical_keys.clear()
-    forwarded_modifier_keys.clear()
-    suppressed_keyup_codes.clear()
-    triggered_combo_keys.clear()
+    device_states.clear()
+    virtual_key_owners.clear()
     virtual_pressed_keys.clear()
+    reset_transient_text_state(reason)
 
 def release_stale_virtual_keys_if_idle() -> None:
     if virtual_uinput is None:
         return
 
-    if pressed_physical_keys:
+    if all_pressed_physical_keys():
         return
 
     if not virtual_pressed_keys:
@@ -781,9 +854,10 @@ def debug_beep_for_key_event(code: int, value: int) -> None:
         pass
 
 def physical_modifiers() -> set[str]:
+    pressed = all_pressed_physical_keys()
     active: set[str] = set()
     for modifier_name, keycodes in MODIFIER_KEYCODES.items():
-        if pressed_physical_keys & keycodes:
+        if pressed & keycodes:
             active.add(modifier_name)
     return active
 
@@ -794,10 +868,20 @@ def has_non_text_modifier() -> bool:
 
 def state_snapshot() -> dict[str, Any]:
     return {
-        "pressed": [key_name(code) for code in sorted(pressed_physical_keys)],
-        "forwarded_modifiers": [key_name(code) for code in sorted(forwarded_modifier_keys)],
-        "suppressed_keyups": [key_name(code) for code in sorted(suppressed_keyup_codes)],
-        "triggered_keys": [key_name(code) for code in sorted(triggered_combo_keys)],
+        "pressed": [key_name(code) for code in sorted(all_pressed_physical_keys())],
+        "virtual_owners": {
+            key_name(code): sorted(owners)
+            for code, owners in sorted(virtual_key_owners.items())
+        },
+        "devices": {
+            device_id: {
+                "pressed": [key_name(code) for code in sorted(state.pressed)],
+                "forwarded_modifiers": [key_name(code) for code in sorted(state.forwarded_modifiers)],
+                "suppressed_keyups": [key_name(code) for code in sorted(state.suppressed_keyups)],
+                "triggered_keys": [key_name(code) for code in sorted(state.triggered_combo_keys)],
+            }
+            for device_id, state in sorted(device_states.items())
+        },
         "mods": sorted(physical_modifiers()),
         "typed_buffer": typed_buffer[-40:],
         "pending_sequence_match": pending_sequence_match,
@@ -833,7 +917,7 @@ def send_key(code: int, value: int, reason: str) -> None:
         value_name(value),
         reason,
         [key_name(item) for item in sorted(virtual_pressed_keys)],
-        [key_name(item) for item in sorted(pressed_physical_keys)],
+        [key_name(item) for item in sorted(all_pressed_physical_keys())],
     )
 
     virtual_uinput.write(ecodes.EV_KEY, code, value)
@@ -860,8 +944,39 @@ def send_backspaces(count: int, reason: str) -> None:
         time.sleep(BACKSPACE_DELAY_MS / 1000.0)
 
 
+def forward_owned_key_event(event, device_id: str, device_name: str, reason: str) -> bool:
+    """Forward aggregate key transitions while retaining per-device ownership."""
+    code = event.code
+    owners = virtual_key_owners.get(code)
+
+    if event.value == 1:
+        if owners is None:
+            owners = set()
+            virtual_key_owners[code] = owners
+        if device_id in owners:
+            return False
+        first_owner = not owners
+        owners.add(device_id)
+        if first_owner:
+            forward_event(event, reason, device_name)
+        return first_owner
+
+    if event.value == 0:
+        if not owners or device_id not in owners:
+            logger.debug("ignore unowned keyup key=%s dev=%s", key_name(code), device_name)
+            return False
+        owners.remove(device_id)
+        if owners:
+            return False
+        virtual_key_owners.pop(code, None)
+        forward_event(event, reason, device_name)
+        return True
+
+    raise ValueError(f"ownership helper received key value {event.value}")
+
+
 def release_forwarded_modifiers() -> None:
-    to_release = list(forwarded_modifier_keys)
+    to_release = sorted(all_state_codes("forwarded_modifiers"))
     if not to_release:
         return
 
@@ -872,11 +987,16 @@ def release_forwarded_modifiers() -> None:
     )
 
     for code in to_release:
-        write_key(code, 0, "release_forwarded_modifiers")
-        suppressed_keyup_codes.add(code)
+        owners = virtual_key_owners.pop(code, set())
+        for device_id in owners:
+            state = device_states.get(device_id)
+            if state is not None:
+                state.suppressed_keyups.add(code)
+                state.forwarded_modifiers.discard(code)
+        if code in virtual_pressed_keys:
+            write_key(code, 0, "release_forwarded_modifiers")
 
     sync("release_forwarded_modifiers")
-    forwarded_modifier_keys.clear()
     logger.debug("release_forwarded_modifiers end state=%s", state_snapshot())
 
 
@@ -943,7 +1063,7 @@ def forward_event(event, reason: str, device_name: str) -> None:
             device_name,
             reason,
             [key_name(item) for item in sorted(virtual_pressed_keys)],
-            [key_name(item) for item in sorted(pressed_physical_keys)],
+            [key_name(item) for item in sorted(all_pressed_physical_keys())],
             state_snapshot(),
         )
 
@@ -1073,18 +1193,25 @@ def run_queued_sequence_if_any() -> bool:
 
 
 def should_run_queued_sequence_now() -> bool:
-    return pending_sequence_run is not None and len(pressed_physical_keys) == 0
+    return pending_sequence_run is not None and not all_pressed_physical_keys()
 
 
 # -----------------------------------------------------------------------------
 # Input event handling
 # -----------------------------------------------------------------------------
 
-def handle_key_event(event, device_name: str, substitutions: dict, sequences: dict) -> None:
+def handle_key_event(
+    event,
+    device_id: str,
+    device_name: str,
+    substitutions: dict,
+    sequences: dict,
+) -> None:
     global pending_sequence_match
 
     code = event.code
     value = event.value
+    state = device_states.setdefault(device_id, DeviceKeyState())
     record_bug_trace("in", code, value, device_name=device_name)
 
     logger.debug(
@@ -1098,20 +1225,22 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
     debug_beep_for_key_event(code, value)
 
     if value == 1:  # key down
-        pressed_physical_keys.add(code)
+        was_globally_pressed = is_physically_pressed(code)
+        state.pressed.add(code)
+        state.reported_orphan_repeats.discard(code)
 
-        if xkb_decoder is not None:
+        if xkb_decoder is not None and not was_globally_pressed:
             xkb_decoder.update_key(code, True)
 
         if code in ALL_MODIFIER_KEYS:
-            forward_event(event, "modifier_passthrough", device_name)
-            forwarded_modifier_keys.add(code)
+            forward_owned_key_event(event, device_id, device_name, "modifier_passthrough")
+            state.forwarded_modifiers.add(code)
             return
 
         combo = (frozenset(physical_modifiers()), code)
         matched = substitutions.get(combo)
         if matched:
-            triggered_combo_keys.add(code)
+            state.triggered_combo_keys.add(code)
             logger.info(
                 "matched combo=%s dev=%s output=%r",
                 matched["combo_text"],
@@ -1122,7 +1251,7 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
             type_text(matched["output"])
             return
 
-        forward_event(event, "normal_key_passthrough", device_name)
+        forward_owned_key_event(event, device_id, device_name, "normal_key_passthrough")
 
         if not has_non_text_modifier():
             update_typed_buffer_from_keydown(code)
@@ -1138,25 +1267,26 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
         return
 
     if value == 0:  # key up
-        pressed_physical_keys.discard(code)
+        state.pressed.discard(code)
+        state.reported_orphan_repeats.discard(code)
 
-        if xkb_decoder is not None:
+        if xkb_decoder is not None and not is_physically_pressed(code):
             xkb_decoder.update_key(code, False)
 
-        if code in suppressed_keyup_codes:
+        if code in state.suppressed_keyups:
             logger.debug("suppress physical keyup key=%s state=%s", key_name(code), state_snapshot())
-            suppressed_keyup_codes.discard(code)
+            state.suppressed_keyups.discard(code)
             return
 
-        if code in triggered_combo_keys:
+        if code in state.triggered_combo_keys:
             logger.debug("suppress triggered combo keyup key=%s state=%s", key_name(code), state_snapshot())
-            triggered_combo_keys.discard(code)
+            state.triggered_combo_keys.discard(code)
             return
 
         if code in ALL_MODIFIER_KEYS:
-            forwarded_modifier_keys.discard(code)
+            state.forwarded_modifiers.discard(code)
 
-        forward_event(event, "keyup_passthrough", device_name)
+        forward_owned_key_event(event, device_id, device_name, "keyup_passthrough")
         queue_pending_sequence_if_matches(code)
         return
 
@@ -1168,7 +1298,13 @@ def handle_key_event(event, device_name: str, substitutions: dict, sequences: di
             state_snapshot(),
         )
 
-        if code in triggered_combo_keys:
+        if code in state.triggered_combo_keys:
+            return
+
+        if device_id not in virtual_key_owners.get(code, set()) or code not in virtual_pressed_keys:
+            if code not in state.reported_orphan_repeats:
+                state.reported_orphan_repeats.add(code)
+                dump_bug_context("orphan_repeat_suppressed", device=device_name, key=key_name(code))
             return
 
         forward_event(event, "repeat_passthrough", device_name)
@@ -1392,11 +1528,12 @@ def remove_polled_device(
     if dev is None:
         return
 
-    # A disappearing device may never deliver key-up events for keys that were
-    # held when it disconnected. Release the shared virtual state immediately;
-    # otherwise compositors such as Sway can consider that key held across the
-    # whole seat and suppress the same key from every attached keyboard.
-    release_all_virtual_keys(f"device_removed({getattr(dev, 'name', '?')})")
+    # Release only keys owned by this device. Other keyboards may legitimately
+    # be holding the same key and must keep their virtual ownership.
+    release_device_keys(
+        getattr(dev, "path", f"fd:{fd}"),
+        f"device_removed({getattr(dev, 'name', '?')})",
+    )
 
     open_devices = [item for item in open_devices if item.fd != fd]
 
@@ -1566,7 +1703,7 @@ def main() -> None:
                         # make typing feel delayed on busy devices.
                         continue
 
-                    handle_key_event(event, dev.name, substitutions, sequences)
+                    handle_key_event(event, dev.path, dev.name, substitutions, sequences)
 
             except BlockingIOError:
                 continue
