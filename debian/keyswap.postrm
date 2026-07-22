@@ -5,6 +5,8 @@ case "$1" in
   remove|purge)
     if command -v udevadm >/dev/null 2>&1; then
       udevadm control --reload-rules || true
+      udevadm trigger --subsystem-match=input --action=change || true
+      udevadm trigger --sysname-match=uinput --action=change || true
     fi
     ;;
 esac

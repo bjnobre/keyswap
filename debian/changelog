@@ -1,5 +1,8 @@
 keyswap (0.1.0-1) unstable; urgency=medium
 
   * Initial package.
+  * Declare the adduser and libxkbcommon0 runtime dependencies.
+  * Apply udev permission changes to existing devices on install and removal.
+  * Refer users to README.Debian for post-installation setup.
 
  -- Bene <bene@bjnobre.com>  Wed, 22 Apr 2026 14:55:00 -0400

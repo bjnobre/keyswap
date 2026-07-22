@@ -15,8 +15,9 @@ Architecture: all
 Depends:
  ${misc:Depends},
  ${python3:Depends},
- python3,
- python3-evdev
+ adduser,
+ python3-evdev,
+ libxkbcommon0
 Description: user-level keyboard substitution daemon using evdev and uinput
  Keyswap listens to configured or automatically discovered keyboard
  devices, detects configured key combinations, and injects replacement
