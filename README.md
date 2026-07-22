@@ -81,9 +81,9 @@ Static `/dev/input/eventN` paths can change after reconnects. Prefer `"devices":
 
 Do not judge typing latency while running with `--verbose`; debug logging is intentionally noisy and can affect interactive testing.
 
-The systemd service uses `--log-level info`. This records startup, device
-changes, matched substitutions, and sequence expansions in the journal without
-logging every key event or the continuously updated typed buffer. Follow it with:
+The systemd service uses the default `warning` log level, which records errors,
+unusual conditions, and captured `BUG_CONTEXT` incidents without routine event
+logging. Follow it with:
 
 ```bash
 journalctl --user -u keyswap.service -f

@@ -3,7 +3,7 @@ Description=Keyswap keyboard substitution daemon
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /usr/lib/keyswap/keyswap.py --log-level info
+ExecStart=/usr/bin/python3 /usr/lib/keyswap/keyswap.py
 Restart=on-failure
 RestartSec=1
 
