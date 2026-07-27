@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -f "$script_dir/../keyswap.py" ]; then
+    exec /usr/bin/env python3 "$script_dir/../keyswap.py" "$@"
+fi
+
+exec /usr/bin/python3 /usr/lib/keyswap/keyswap.py "$@"

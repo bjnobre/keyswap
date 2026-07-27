@@ -36,6 +36,7 @@ What currently works:
 - removal of dead/hung-up input fds from the poll loop
 - automatic keyboard discovery with `"devices": "auto"`
 - hotplug/re-discovery for keyboards that disappear and later return, using `/dev/input` notifications when available
+- CLI commands for managing mappings, validating config, controlling the user service, and reading its journal
 
 What is still rough:
 
@@ -44,7 +45,6 @@ What is still rough:
 - output character support is still limited to the built-in `CHARMAP`
 - sequence expansion is still timing-sensitive under some fast typing patterns
 - devices are accepted from config without strong keyboard-capability validation yet
-- no helper CLI yet
 - no formal release process yet
 
 ---
@@ -78,6 +78,65 @@ Static device paths are still supported when you need explicit control:
 ```
 
 Static `/dev/input/eventN` paths can change after reconnects. Prefer `"devices": "auto"` unless you have a specific reason to pin devices manually.
+
+## Command-line interface
+
+Run `keyswap` after installing the package, or `./bin/keyswap` from a source
+checkout. Commands use `~/.config/keyswap/config.json` when it exists and fall
+back to `/etc/keyswap/config.json`. Pass `--config PATH` before the command to
+manage another file.
+
+List mappings:
+
+```bash
+keyswap list all
+keyswap list substitutions
+keyswap list expansions
+```
+
+Add, replace, or delete mappings:
+
+```bash
+keyswap add substitution C-nk_minus "="
+keyswap add expansion :phone "1234567890"
+keyswap add expansion :phone "new value" --force
+keyswap delete substitution C-nk_minus
+keyswap delete expansion :phone
+```
+
+The CLI calls typed sequences “expansions”; the JSON configuration continues
+to store them under `"sequences"` for compatibility. Changes are validated
+before the original file is atomically replaced. Existing mappings are not
+overwritten unless `--force` is passed.
+
+Validate configuration without opening input devices or starting the daemon:
+
+```bash
+keyswap test
+keyswap --config ./config/config.json test
+```
+
+Control the existing systemd user service:
+
+```bash
+keyswap start
+keyswap stop
+keyswap restart
+keyswap status
+```
+
+Read existing service logs from the systemd user journal:
+
+```bash
+keyswap history
+keyswap history --lines 25
+keyswap history --since today
+keyswap history --bugs
+```
+
+`history` does not create a separate history database or enable additional
+event logging. The `--bugs` option filters for the existing `BUG_CONTEXT`
+incident records.
 
 Do not judge typing latency while running with `--verbose`; debug logging is intentionally noisy and can affect interactive testing.
 

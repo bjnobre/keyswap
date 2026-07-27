@@ -1,3 +1,12 @@
+keyswap (0.1.0-2) unstable; urgency=medium
+
+  * Add commands to list, add, and delete substitutions and expansions.
+  * Add configuration validation and atomic updates.
+  * Add user-service controls and journal-backed history.
+  * Install the keyswap command-line launcher.
+
+ -- Bene <bene@bjnobre.com>  Sun, 26 Jul 2026 00:00:00 -0400
+
 keyswap (0.1.0-1) unstable; urgency=medium
 
   * Initial package.
