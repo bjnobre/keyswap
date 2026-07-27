@@ -25,6 +25,7 @@ import os
 import select
 import signal
 import sys
+import tempfile
 import time
 import subprocess
 from collections import deque
@@ -494,8 +495,10 @@ def setup_logging(log_level: str) -> logging.Logger:
     return logging.getLogger("keyswap")
 
 
-def parse_args() -> tuple[Path, str, bool]:
-    parser = argparse.ArgumentParser()
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Keyboard substitution and text-expansion daemon and configuration CLI."
+    )
     parser.add_argument("-c", "--config", help="Explicit config path")
     parser.add_argument(
         "--log-level",
@@ -509,17 +512,78 @@ def parse_args() -> tuple[Path, str, bool]:
         help="Alias for --log-level debug",
     )
     parser.add_argument("--dump-config", action="store_true")
-    args = parser.parse_args()
-    log_level = "debug" if args.verbose else args.log_level
+    subparsers = parser.add_subparsers(dest="command")
 
-    if args.config:
-        return Path(args.config).expanduser().resolve(), log_level, args.dump_config
+    list_parser = subparsers.add_parser("list", help="List configured mappings")
+    list_parser.add_argument(
+        "category",
+        nargs="?",
+        default="all",
+        choices=("all", "substitutions", "expansions"),
+    )
 
+    add_parser = subparsers.add_parser("add", help="Add a configured mapping")
+    add_parser.add_argument("mapping_type", choices=("substitution", "expansion"))
+    add_parser.add_argument("trigger")
+    add_parser.add_argument("replacement")
+    add_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an existing mapping with the same trigger",
+    )
+
+    delete_parser = subparsers.add_parser("delete", help="Delete a configured mapping")
+    delete_parser.add_argument("mapping_type", choices=("substitution", "expansion"))
+    delete_parser.add_argument("trigger")
+
+    subparsers.add_parser("test", help="Validate the configuration")
+    service_help = {
+        "start": "Start the user service",
+        "stop": "Stop the user service",
+        "restart": "Restart the user service",
+        "status": "Show user service status",
+    }
+    for command, help_text in service_help.items():
+        subparsers.add_parser(command, help=help_text)
+
+    history_parser = subparsers.add_parser(
+        "history",
+        help="Show logs from the systemd user journal",
+    )
+    history_parser.add_argument(
+        "-n",
+        "--lines",
+        type=positive_int,
+        default=100,
+        help="Number of journal lines to show (default: 100)",
+    )
+    history_parser.add_argument("--since", help="journalctl time expression")
+    history_parser.add_argument(
+        "--bugs",
+        action="store_true",
+        help="Show only existing BUG_CONTEXT incident entries",
+    )
+    return parser
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def resolve_config_path(explicit_path: str | None) -> Path:
+    if explicit_path:
+        return Path(explicit_path).expanduser().resolve()
     user_config = resolve_user_config_path()
     if user_config.is_file():
-        return user_config.resolve(), log_level, args.dump_config
+        return user_config.resolve()
+    return SYSTEM_CONFIG_PATH
 
-    return SYSTEM_CONFIG_PATH, log_level, args.dump_config
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return build_argument_parser().parse_args(argv)
 
 
 def parse_key(name: str) -> int:
@@ -553,12 +617,40 @@ def parse_combo(combo: str) -> tuple[set[str], int]:
     return required_modifiers, parse_key(parts[-1])
 
 
-def load_config(config_path: Path) -> tuple[DeviceSelection, dict, dict, dict]:
+def load_raw_config(config_path: Path) -> dict[str, Any]:
     with open(config_path, "r", encoding="utf-8") as handle:
         raw = json.load(handle)
 
+    if not isinstance(raw, dict):
+        raise ValueError("config root must be an object/map")
     if "substitutions" not in raw:
         raise ValueError("config must contain 'substitutions'")
+    if not isinstance(raw["substitutions"], dict):
+        raise ValueError("'substitutions' must be an object/map")
+    for combo, output in raw["substitutions"].items():
+        if not isinstance(combo, str) or not combo:
+            raise ValueError("substitution combos must be non-empty strings")
+        if not isinstance(output, str):
+            raise ValueError(f"substitution output for {combo!r} must be a string")
+
+    sequences = raw.get("sequences", {})
+    if not isinstance(sequences, dict):
+        raise ValueError("'sequences' must be an object/map")
+    for trigger, replacement in sequences.items():
+        if not isinstance(trigger, str) or not trigger:
+            raise ValueError("sequence triggers must be non-empty strings")
+        if not isinstance(replacement, str):
+            raise ValueError(f"sequence replacement for {trigger!r} must be a string")
+        if len(trigger) > SEQUENCE_BUFFER_MAX_CHARS:
+            raise ValueError(
+                f"sequence trigger {trigger!r} exceeds the "
+                f"{SEQUENCE_BUFFER_MAX_CHARS}-character limit"
+            )
+    return raw
+
+
+def load_config(config_path: Path) -> tuple[DeviceSelection, dict, dict, dict]:
+    raw = load_raw_config(config_path)
 
     if "devices" in raw:
         configured_devices = raw["devices"]
@@ -589,22 +681,129 @@ def load_config(config_path: Path) -> tuple[DeviceSelection, dict, dict, dict]:
         }
 
     sequences = raw.get("sequences", {})
-    if not isinstance(sequences, dict):
-        raise ValueError("'sequences' must be an object/map")
-    for trigger in sequences:
-        if not isinstance(trigger, str) or not trigger:
-            raise ValueError("sequence triggers must be non-empty strings")
-        if len(trigger) > SEQUENCE_BUFFER_MAX_CHARS:
-            raise ValueError(
-                f"sequence trigger {trigger!r} exceeds the "
-                f"{SEQUENCE_BUFFER_MAX_CHARS}-character limit"
-            )
 
     xkb_config = raw.get("xkb", {})
     if not isinstance(xkb_config, dict):
         raise ValueError("'xkb' must be an object/map when present")
 
     return device_selection, substitutions, sequences, xkb_config
+
+
+def write_config_atomically(config_path: Path, raw: dict[str, Any]) -> None:
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_mode = config_path.stat().st_mode & 0o777 if config_path.exists() else 0o600
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=config_path.parent,
+            prefix=f".{config_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(raw, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_path.chmod(existing_mode)
+        os.replace(temporary_path, config_path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def mapping_section(mapping_type: str) -> str:
+    return "substitutions" if mapping_type == "substitution" else "sequences"
+
+
+def list_config(config_path: Path, category: str) -> None:
+    raw = load_raw_config(config_path)
+    print(f"config: {config_path}")
+    if category in ("all", "substitutions"):
+        print("substitutions:")
+        for trigger, replacement in raw["substitutions"].items():
+            print(f"  {trigger} -> {replacement!r}")
+    if category in ("all", "expansions"):
+        print("expansions:")
+        for trigger, replacement in raw.get("sequences", {}).items():
+            print(f"  {trigger!r} -> {replacement!r}")
+
+
+def add_mapping(
+    config_path: Path,
+    mapping_type: str,
+    trigger: str,
+    replacement: str,
+    force: bool,
+) -> None:
+    raw = load_raw_config(config_path)
+    section_name = mapping_section(mapping_type)
+    section = raw.setdefault(section_name, {})
+    if trigger in section and not force:
+        raise ValueError(
+            f"{mapping_type} {trigger!r} already exists; use --force to replace it"
+        )
+    section[trigger] = replacement
+    validate_raw_config(raw, config_path)
+    write_config_atomically(config_path, raw)
+    print(f"added {mapping_type} {trigger!r} -> {replacement!r}")
+
+
+def delete_mapping(config_path: Path, mapping_type: str, trigger: str) -> None:
+    raw = load_raw_config(config_path)
+    section_name = mapping_section(mapping_type)
+    section = raw.get(section_name, {})
+    if trigger not in section:
+        raise ValueError(f"{mapping_type} {trigger!r} does not exist")
+    del section[trigger]
+    validate_raw_config(raw, config_path)
+    write_config_atomically(config_path, raw)
+    print(f"deleted {mapping_type} {trigger!r}")
+
+
+def validate_raw_config(raw: dict[str, Any], config_path: Path) -> None:
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".json",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(raw, handle)
+        load_config(temporary_path)
+    except ValueError as exc:
+        raise ValueError(f"invalid change for {config_path}: {exc}") from exc
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def run_service_command(command: str) -> int:
+    args = ["systemctl", "--user", command, "keyswap.service"]
+    if command == "status":
+        args.append("--no-pager")
+    return subprocess.run(args, check=False).returncode
+
+
+def show_history(lines: int, since: str | None, bugs_only: bool) -> int:
+    args = [
+        "journalctl",
+        "--user",
+        "-u",
+        "keyswap.service",
+        "--no-pager",
+        "-n",
+        str(lines),
+    ]
+    if since:
+        args.extend(["--since", since])
+    if bugs_only:
+        args.extend(["--grep", "BUG_CONTEXT"])
+    return subprocess.run(args, check=False).returncode
 
 
 def dump_loaded_config(
@@ -1598,18 +1797,49 @@ def cleanup_and_exit(*_args) -> None:
 # Main
 # -----------------------------------------------------------------------------
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     global open_devices, virtual_uinput, logger, xkb_decoder, last_poll_wakeup_time
 
-    config_path, log_level, dump_config = parse_args()
+    args = parse_args(argv)
+    config_path = resolve_config_path(args.config)
+    log_level = "debug" if args.verbose else args.log_level
+
+    try:
+        if args.command == "list":
+            list_config(config_path, args.category)
+            return 0
+        if args.command == "add":
+            add_mapping(
+                config_path,
+                args.mapping_type,
+                args.trigger,
+                args.replacement,
+                args.force,
+            )
+            return 0
+        if args.command == "delete":
+            delete_mapping(config_path, args.mapping_type, args.trigger)
+            return 0
+        if args.command == "test":
+            load_config(config_path)
+            print(f"config is valid: {config_path}")
+            return 0
+        if args.command in ("start", "stop", "restart", "status"):
+            return run_service_command(args.command)
+        if args.command == "history":
+            return show_history(args.lines, args.since, args.bugs)
+    except (OSError, ValueError) as exc:
+        print(f"keyswap: error: {exc}", file=sys.stderr)
+        return 2
+
     logger = setup_logging(log_level)
     logger.info("using config: %s", config_path)
 
     device_selection, substitutions, sequences, xkb_config = load_config(config_path)
 
-    if dump_config:
+    if args.dump_config:
         dump_loaded_config(config_path, device_selection, substitutions, sequences, xkb_config)
-        return
+        return 0
 
     xkb_decoder = XKBDecoder(xkb_config)
     logger.info("xkb layout info: %s", xkb_decoder.layout_info)
@@ -1741,6 +1971,8 @@ def main() -> None:
 
         release_stale_virtual_keys_if_idle()
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
