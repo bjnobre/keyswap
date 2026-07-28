@@ -45,8 +45,8 @@ class KeyRepeatTests(unittest.TestCase):
         keyswap.virtual_pressed_keys.clear()
         keyswap.bug_trace.clear()
         keyswap.typed_buffer = ""
-        keyswap.pending_sequence_match = None
-        keyswap.pending_sequence_run = None
+        keyswap.pending_expansion_match = None
+        keyswap.pending_expansion_run = None
 
     @staticmethod
     def event(value):
@@ -120,8 +120,8 @@ class MultiDeviceOwnershipTests(unittest.TestCase):
         keyswap.virtual_pressed_keys.clear()
         keyswap.bug_trace.clear()
         keyswap.typed_buffer = ""
-        keyswap.pending_sequence_match = None
-        keyswap.pending_sequence_run = None
+        keyswap.pending_expansion_match = None
+        keyswap.pending_expansion_run = None
 
     @staticmethod
     def event(code, value):
@@ -222,6 +222,91 @@ class VirtualDeviceCapabilityTests(unittest.TestCase):
         self.assertIn(ecodes.KEY_A, capabilities[ecodes.EV_KEY])
 
 
+class DeviceReconnectTests(unittest.TestCase):
+    def test_removing_polled_device_requests_post_removal_rescan(self):
+        device = SimpleNamespace(
+            fd=21,
+            path="/dev/input/event21",
+            name="Logi K250",
+            ungrab=lambda: None,
+            close=lambda: None,
+        )
+        poller = SimpleNamespace(unregister=lambda _fd: None)
+        fd_to_device = {device.fd: device}
+        original_open_devices = keyswap.open_devices
+        original_logger = keyswap.logger
+        try:
+            keyswap.open_devices = [device]
+            keyswap.logger = logging.getLogger("keyswap-reconnect-test")
+            with patch.object(keyswap, "release_device_keys"):
+                should_rescan = keyswap.remove_polled_device(
+                    poller,
+                    fd_to_device,
+                    device.fd,
+                    "invalid poll mask=24",
+                )
+        finally:
+            keyswap.open_devices = original_open_devices
+            keyswap.logger = original_logger
+
+        self.assertTrue(should_rescan)
+        self.assertEqual(fd_to_device, {})
+
+
+class StuckKeyReconciliationTests(unittest.TestCase):
+    def setUp(self):
+        keyswap.logger = logging.getLogger("keyswap-stuck-key-test")
+        keyswap.xkb_decoder = None
+        keyswap.virtual_uinput = FakeUInput()
+        keyswap.device_states.clear()
+        keyswap.virtual_key_owners.clear()
+        keyswap.virtual_pressed_keys.clear()
+        keyswap.bug_trace.clear()
+
+    def test_lost_keyup_is_released_when_kernel_reports_key_not_active(self):
+        path = "/dev/input/event21"
+        code = ecodes.KEY_LEFTMETA
+        state = keyswap.DeviceKeyState()
+        state.pressed.add(code)
+        state.forwarded_modifiers.add(code)
+        keyswap.device_states[path] = state
+        keyswap.virtual_key_owners[code] = {path}
+        keyswap.virtual_pressed_keys.add(code)
+        device = SimpleNamespace(
+            path=path,
+            name="Logi K250",
+            active_keys=lambda: [],
+        )
+
+        reconciled = keyswap.reconcile_stuck_device_keys(device)
+
+        self.assertEqual(reconciled, {code})
+        self.assertNotIn(code, state.pressed)
+        self.assertNotIn(code, keyswap.virtual_key_owners)
+        self.assertNotIn(code, keyswap.virtual_pressed_keys)
+        self.assertIn((ecodes.EV_KEY, code, 0), keyswap.virtual_uinput.events)
+
+    def test_intentionally_held_key_is_not_released(self):
+        path = "/dev/input/event21"
+        code = ecodes.KEY_LEFTSHIFT
+        state = keyswap.DeviceKeyState()
+        state.pressed.add(code)
+        keyswap.device_states[path] = state
+        keyswap.virtual_key_owners[code] = {path}
+        keyswap.virtual_pressed_keys.add(code)
+        device = SimpleNamespace(
+            path=path,
+            name="Logi K250",
+            active_keys=lambda: [code],
+        )
+
+        reconciled = keyswap.reconcile_stuck_device_keys(device)
+
+        self.assertEqual(reconciled, set())
+        self.assertIn(code, state.pressed)
+        self.assertEqual(keyswap.virtual_uinput.events, [])
+
+
 class BugTracePrivacyTests(unittest.TestCase):
     def test_text_keys_are_redacted_but_navigation_keys_are_named(self):
         self.assertEqual(keyswap.diagnostic_key_name(ecodes.KEY_A), "<text-key>")
@@ -229,10 +314,10 @@ class BugTracePrivacyTests(unittest.TestCase):
 
     def test_persistent_state_snapshot_redacts_typed_text(self):
         original_buffer = keyswap.typed_buffer
-        original_pending = keyswap.pending_sequence_match
+        original_pending = keyswap.pending_expansion_match
         try:
             keyswap.typed_buffer = "private text"
-            keyswap.pending_sequence_match = {
+            keyswap.pending_expansion_match = {
                 "trigger": "secret",
                 "replacement": "also secret",
                 "last_code": ecodes.KEY_T,
@@ -240,23 +325,23 @@ class BugTracePrivacyTests(unittest.TestCase):
             snapshot = keyswap.diagnostic_state_snapshot()
         finally:
             keyswap.typed_buffer = original_buffer
-            keyswap.pending_sequence_match = original_pending
+            keyswap.pending_expansion_match = original_pending
 
         self.assertEqual(snapshot["typed_buffer"], "<redacted length=12>")
-        self.assertIs(snapshot["pending_sequence_match"], True)
+        self.assertIs(snapshot["pending_expansion_match"], True)
         self.assertNotIn("private", repr(snapshot))
         self.assertNotIn("secret", repr(snapshot))
 
 
-class SequenceBufferTests(unittest.TestCase):
-    def test_sequence_buffer_limit_is_twenty_characters(self):
-        self.assertEqual(keyswap.SEQUENCE_BUFFER_MAX_CHARS, 20)
+class ExpansionBufferTests(unittest.TestCase):
+    def test_expansion_buffer_limit_is_twenty_characters(self):
+        self.assertEqual(keyswap.EXPANSION_BUFFER_MAX_CHARS, 20)
 
-    def test_config_rejects_trigger_longer_than_sequence_buffer(self):
+    def test_config_rejects_trigger_longer_than_expansion_buffer(self):
         config = {
             "devices": "auto",
             "substitutions": {},
-            "sequences": {"x" * 21: "replacement"},
+            "expansions": {"x" * 21: "replacement"},
         }
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as handle:
             json.dump(config, handle)
@@ -267,15 +352,18 @@ class SequenceBufferTests(unittest.TestCase):
     def test_typed_buffer_is_trimmed_to_twenty_characters(self):
         original_buffer = keyswap.typed_buffer
         original_decoder = keyswap.xkb_decoder
+        original_logger = keyswap.logger
         try:
             keyswap.typed_buffer = ""
             keyswap.xkb_decoder = SimpleNamespace(char_for_keydown=lambda _code: "x")
+            keyswap.logger = logging.getLogger("keyswap-expansion-buffer-test")
             for _ in range(25):
                 keyswap.update_typed_buffer_from_keydown(ecodes.KEY_X)
             result = keyswap.typed_buffer
         finally:
             keyswap.typed_buffer = original_buffer
             keyswap.xkb_decoder = original_decoder
+            keyswap.logger = original_logger
 
         self.assertEqual(result, "x" * 20)
 

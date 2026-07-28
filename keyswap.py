@@ -6,7 +6,7 @@ What it does:
 - Watches one or more input devices through evdev
 - Re-emits events through a uinput virtual device
 - Supports combo substitutions (e.g. C-nk_minus -> "=")
-- Supports sequence expansions (e.g. ":123" -> "1234567890")
+- Supports text expansions (e.g. ":123" -> "1234567890")
 - Decodes typed characters through xkbcommon so layout-dependent text works better
 
 Notes:
@@ -50,6 +50,7 @@ INPUT_EVENT_GLOB = "/dev/input/event*"
 AUTO_DEVICES_MODE = "auto"
 AUTO_RESCAN_INTERVAL_SEC = 60.0
 AUTO_POLL_TIMEOUT_MS = 500
+STUCK_KEY_RECONCILE_INTERVAL_SEC = 1.0
 INPUT_DIR = Path("/dev/input")
 
 # Linux inotify constants. Used to avoid rescanning /dev/input on a timer.
@@ -84,11 +85,11 @@ PSEUDO_KEYBOARD_NAMES = {
     "HDA Digital PCBeep",
 }
 
-# Timing controls for sequence expansion.
-SEQUENCE_BACKSPACE_SETTLE_MS = 10
+# Timing controls for text expansion.
+EXPANSION_BACKSPACE_SETTLE_MS = 10
 TYPE_CHAR_DELAY_MS = 5
 BACKSPACE_DELAY_MS = 1
-SEQUENCE_BUFFER_MAX_CHARS = 20
+EXPANSION_BUFFER_MAX_CHARS = 20
 
 # Keep a quiet, bounded history of key traffic. It is only written to the
 # journal when an anomalous state is detected, giving intermittent keyboard
@@ -277,8 +278,8 @@ for accent_name, (accented_chars, base_chars) in DEAD_KEY_CHARACTERS.items():
 CHARMAP_KEYCODES = {keycode for keycode, _needs_shift in CHARMAP.values()}
 CHARMAP_KEYCODES.update(
     keycode
-    for sequence in DEAD_KEY_CHARMAP.values()
-    for keycode, _needs_shift in sequence
+    for steps in DEAD_KEY_CHARMAP.values()
+    for keycode, _needs_shift in steps
 )
 
 # Uinput capabilities cannot be expanded after the virtual device is created.
@@ -318,8 +319,8 @@ last_poll_wakeup_time = time.monotonic()
 
 typed_buffer = ""
 
-pending_sequence_match: dict[str, Any] | None = None
-pending_sequence_run: dict[str, Any] | None = None
+pending_expansion_match: dict[str, Any] | None = None
+pending_expansion_run: dict[str, Any] | None = None
 
 open_devices: list[InputDevice] = []
 virtual_uinput: UInput | None = None
@@ -633,18 +634,22 @@ def load_raw_config(config_path: Path) -> dict[str, Any]:
         if not isinstance(output, str):
             raise ValueError(f"substitution output for {combo!r} must be a string")
 
-    sequences = raw.get("sequences", {})
-    if not isinstance(sequences, dict):
-        raise ValueError("'sequences' must be an object/map")
-    for trigger, replacement in sequences.items():
+    if "sequences" in raw:
+        raise ValueError(
+            "unsupported config key 'sequences'; rename it to 'expansions'"
+        )
+    expansions = raw.get("expansions", {})
+    if not isinstance(expansions, dict):
+        raise ValueError("'expansions' must be an object/map")
+    for trigger, replacement in expansions.items():
         if not isinstance(trigger, str) or not trigger:
-            raise ValueError("sequence triggers must be non-empty strings")
+            raise ValueError("expansion triggers must be non-empty strings")
         if not isinstance(replacement, str):
-            raise ValueError(f"sequence replacement for {trigger!r} must be a string")
-        if len(trigger) > SEQUENCE_BUFFER_MAX_CHARS:
+            raise ValueError(f"expansion replacement for {trigger!r} must be a string")
+        if len(trigger) > EXPANSION_BUFFER_MAX_CHARS:
             raise ValueError(
-                f"sequence trigger {trigger!r} exceeds the "
-                f"{SEQUENCE_BUFFER_MAX_CHARS}-character limit"
+                f"expansion trigger {trigger!r} exceeds the "
+                f"{EXPANSION_BUFFER_MAX_CHARS}-character limit"
             )
     return raw
 
@@ -680,13 +685,13 @@ def load_config(config_path: Path) -> tuple[DeviceSelection, dict, dict, dict]:
             "output": output,
         }
 
-    sequences = raw.get("sequences", {})
+    expansions = raw.get("expansions", {})
 
     xkb_config = raw.get("xkb", {})
     if not isinstance(xkb_config, dict):
         raise ValueError("'xkb' must be an object/map when present")
 
-    return device_selection, substitutions, sequences, xkb_config
+    return device_selection, substitutions, expansions, xkb_config
 
 
 def write_config_atomically(config_path: Path, raw: dict[str, Any]) -> None:
@@ -715,7 +720,7 @@ def write_config_atomically(config_path: Path, raw: dict[str, Any]) -> None:
 
 
 def mapping_section(mapping_type: str) -> str:
-    return "substitutions" if mapping_type == "substitution" else "sequences"
+    return "substitutions" if mapping_type == "substitution" else "expansions"
 
 
 def list_config(config_path: Path, category: str) -> None:
@@ -727,7 +732,7 @@ def list_config(config_path: Path, category: str) -> None:
             print(f"  {trigger} -> {replacement!r}")
     if category in ("all", "expansions"):
         print("expansions:")
-        for trigger, replacement in raw.get("sequences", {}).items():
+        for trigger, replacement in raw.get("expansions", {}).items():
             print(f"  {trigger!r} -> {replacement!r}")
 
 
@@ -810,7 +815,7 @@ def dump_loaded_config(
     config_path: Path,
     device_selection: DeviceSelection,
     substitutions: dict,
-    sequences: dict,
+    expansions: dict,
     xkb_config: dict,
 ) -> None:
     print(f"config: {config_path}")
@@ -825,8 +830,8 @@ def dump_loaded_config(
     for item in substitutions.values():
         print(f"  - {item['combo_text']} -> {item['output']}")
 
-    print("sequences:")
-    for trigger, replacement in sequences.items():
+    print("expansions:")
+    for trigger, replacement in expansions.items():
         print(f"  - {trigger!r} -> {replacement!r}")
 
     print("xkb:")
@@ -900,11 +905,11 @@ def is_physically_pressed(code: int) -> bool:
 
 
 def reset_transient_text_state(reason: str) -> None:
-    global typed_buffer, pending_sequence_match, pending_sequence_run
+    global typed_buffer, pending_expansion_match, pending_expansion_run
 
     typed_buffer = ""
-    pending_sequence_match = None
-    pending_sequence_run = None
+    pending_expansion_match = None
+    pending_expansion_run = None
     if xkb_decoder is not None:
         xkb_decoder.reset_keys(all_pressed_physical_keys())
     if logger is not None:
@@ -941,6 +946,55 @@ def release_device_keys(device_id: str, reason: str) -> None:
             [key_name(code) for code in released],
             sorted(device_states),
         )
+
+
+def reconcile_stuck_device_keys(dev: InputDevice) -> set[int]:
+    """Release tracked keys the kernel no longer reports as physically down."""
+    device_id = dev.path
+    state = device_states.get(device_id)
+    if state is None or not state.pressed:
+        return set()
+
+    active_keys = set(dev.active_keys())
+    missing_keyups = state.pressed - active_keys
+    if not missing_keyups:
+        return set()
+
+    dump_bug_context(
+        "lost_keyup_reconciled",
+        device=device_id,
+        keys=[key_name(code) for code in sorted(missing_keyups)],
+    )
+
+    emitted_keyup = False
+    for code in missing_keyups:
+        state.pressed.discard(code)
+        state.forwarded_modifiers.discard(code)
+        state.suppressed_keyups.discard(code)
+        state.triggered_combo_keys.discard(code)
+        state.reported_orphan_repeats.discard(code)
+
+        owners = virtual_key_owners.get(code)
+        if not owners or device_id not in owners:
+            continue
+        owners.discard(device_id)
+        if owners:
+            continue
+        virtual_key_owners.pop(code, None)
+        write_key(code, 0, "lost_keyup_reconcile")
+        emitted_keyup = True
+
+    if emitted_keyup:
+        sync("lost_keyup_reconcile")
+
+    reset_transient_text_state("lost_keyup_reconcile")
+    logger.warning(
+        "reconciled lost key-up events device=%s name=%s keys=%s",
+        device_id,
+        dev.name,
+        [key_name(code) for code in sorted(missing_keyups)],
+    )
+    return missing_keyups
 
 
 def release_all_virtual_keys(reason: str) -> None:
@@ -1083,7 +1137,7 @@ def state_snapshot() -> dict[str, Any]:
         },
         "mods": sorted(physical_modifiers()),
         "typed_buffer": typed_buffer[-40:],
-        "pending_sequence_match": pending_sequence_match,
+        "pending_expansion_match": pending_expansion_match,
     }
 
 
@@ -1091,7 +1145,7 @@ def diagnostic_state_snapshot() -> dict[str, Any]:
     """Return persistent-log-safe state without typed or replacement text."""
     snapshot = state_snapshot()
     snapshot["typed_buffer"] = f"<redacted length={len(typed_buffer)}>"
-    snapshot["pending_sequence_match"] = pending_sequence_match is not None
+    snapshot["pending_expansion_match"] = pending_expansion_match is not None
     return snapshot
 
 
@@ -1201,7 +1255,7 @@ def release_forwarded_modifiers() -> None:
 
 def type_char(ch: str) -> None:
     if ch in DEAD_KEY_CHARMAP:
-        logger.debug("type_char ch=%r dead_key_sequence", ch)
+        logger.debug("type_char ch=%r dead_key_steps", ch)
         for keycode, needs_shift in DEAD_KEY_CHARMAP[ch]:
             type_keycode(keycode, needs_shift, ch)
         return
@@ -1285,7 +1339,7 @@ def create_virtual_uinput(devices: list[InputDevice]) -> UInput:
 
 
 # -----------------------------------------------------------------------------
-# Sequence expansion helpers
+# Text expansion helpers
 # -----------------------------------------------------------------------------
 
 def update_typed_buffer_from_keydown(code: int) -> None:
@@ -1298,13 +1352,13 @@ def update_typed_buffer_from_keydown(code: int) -> None:
 
     if code == ecodes.KEY_TAB:
         typed_buffer += "\t"
-        typed_buffer = typed_buffer[-SEQUENCE_BUFFER_MAX_CHARS:]
+        typed_buffer = typed_buffer[-EXPANSION_BUFFER_MAX_CHARS:]
         logger.debug("typed_buffer=%r", typed_buffer)
         return
 
     if code == ecodes.KEY_ENTER:
         typed_buffer += "\n"
-        typed_buffer = typed_buffer[-SEQUENCE_BUFFER_MAX_CHARS:]
+        typed_buffer = typed_buffer[-EXPANSION_BUFFER_MAX_CHARS:]
         logger.debug("typed_buffer=%r", typed_buffer)
         return
 
@@ -1319,25 +1373,25 @@ def update_typed_buffer_from_keydown(code: int) -> None:
     ch = xkb_decoder.char_for_keydown(code)
     if ch:
         typed_buffer += ch
-        typed_buffer = typed_buffer[-SEQUENCE_BUFFER_MAX_CHARS:]
+        typed_buffer = typed_buffer[-EXPANSION_BUFFER_MAX_CHARS:]
         logger.debug("typed_buffer=%r", typed_buffer)
 
 
-def maybe_mark_pending_sequence(sequences: dict[str, str], last_code: int) -> bool:
-    global pending_sequence_match
+def maybe_mark_pending_expansion(expansions: dict[str, str], last_code: int) -> bool:
+    global pending_expansion_match
 
-    if pending_sequence_match is not None or not sequences or not typed_buffer:
+    if pending_expansion_match is not None or not expansions or not typed_buffer:
         return False
 
-    for trigger, replacement in sequences.items():
+    for trigger, replacement in expansions.items():
         if typed_buffer.endswith(trigger):
-            pending_sequence_match = {
+            pending_expansion_match = {
                 "trigger": trigger,
                 "replacement": replacement,
                 "last_code": last_code,
             }
             logger.info(
-                "pending sequence trigger=%r replacement=%r last_key=%s",
+                "pending expansion trigger=%r replacement=%r last_key=%s",
                 trigger,
                 replacement,
                 key_name(last_code),
@@ -1347,52 +1401,52 @@ def maybe_mark_pending_sequence(sequences: dict[str, str], last_code: int) -> bo
     return False
 
 
-def queue_pending_sequence_if_matches(code: int) -> bool:
-    global pending_sequence_match, pending_sequence_run
+def queue_pending_expansion_if_matches(code: int) -> bool:
+    global pending_expansion_match, pending_expansion_run
 
-    if pending_sequence_match is None:
+    if pending_expansion_match is None:
         return False
-    if pending_sequence_match["last_code"] != code:
+    if pending_expansion_match["last_code"] != code:
         return False
 
-    pending_sequence_run = pending_sequence_match
-    pending_sequence_match = None
+    pending_expansion_run = pending_expansion_match
+    pending_expansion_match = None
 
     logger.info(
-        "queued sequence trigger=%r replacement=%r on keyup=%s",
-        pending_sequence_run["trigger"],
-        pending_sequence_run["replacement"],
+        "queued expansion trigger=%r replacement=%r on keyup=%s",
+        pending_expansion_run["trigger"],
+        pending_expansion_run["replacement"],
         key_name(code),
     )
     return True
 
 
-def run_queued_sequence_if_any() -> bool:
-    global typed_buffer, pending_sequence_run
+def run_queued_expansion_if_any() -> bool:
+    global typed_buffer, pending_expansion_run
 
-    if pending_sequence_run is None:
+    if pending_expansion_run is None:
         return False
 
-    trigger = pending_sequence_run["trigger"]
-    replacement = pending_sequence_run["replacement"]
+    trigger = pending_expansion_run["trigger"]
+    replacement = pending_expansion_run["replacement"]
 
-    logger.info("running queued sequence trigger=%r replacement=%r", trigger, replacement)
+    logger.info("running queued expansion trigger=%r replacement=%r", trigger, replacement)
 
     release_forwarded_modifiers()
-    send_backspaces(len(trigger), f"sequence_backspace({trigger})")
-    time.sleep(SEQUENCE_BACKSPACE_SETTLE_MS / 1000.0)
+    send_backspaces(len(trigger), f"expansion_backspace({trigger})")
+    time.sleep(EXPANSION_BACKSPACE_SETTLE_MS / 1000.0)
     type_text(replacement)
 
     typed_buffer = typed_buffer[:-len(trigger)] + replacement
-    typed_buffer = typed_buffer[-SEQUENCE_BUFFER_MAX_CHARS:]
+    typed_buffer = typed_buffer[-EXPANSION_BUFFER_MAX_CHARS:]
     logger.debug("typed_buffer=%r", typed_buffer)
 
-    pending_sequence_run = None
+    pending_expansion_run = None
     return True
 
 
-def should_run_queued_sequence_now() -> bool:
-    return pending_sequence_run is not None and not all_pressed_physical_keys()
+def should_run_queued_expansion_now() -> bool:
+    return pending_expansion_run is not None and not all_pressed_physical_keys()
 
 
 # -----------------------------------------------------------------------------
@@ -1404,9 +1458,9 @@ def handle_key_event(
     device_id: str,
     device_name: str,
     substitutions: dict,
-    sequences: dict,
+    expansions: dict,
 ) -> None:
-    global pending_sequence_match
+    global pending_expansion_match
 
     code = event.code
     value = event.value
@@ -1454,7 +1508,7 @@ def handle_key_event(
 
         if not has_non_text_modifier():
             update_typed_buffer_from_keydown(code)
-            maybe_mark_pending_sequence(sequences, code)
+            maybe_mark_pending_expansion(expansions, code)
         else:
             logger.debug(
                 "skip typed_buffer update because non-text modifier is active key=%s mods=%s state=%s",
@@ -1486,7 +1540,7 @@ def handle_key_event(
             state.forwarded_modifiers.discard(code)
 
         forward_owned_key_event(event, device_id, device_name, "keyup_passthrough")
-        queue_pending_sequence_if_matches(code)
+        queue_pending_expansion_if_matches(code)
         return
 
     if value == 2:  # repeat
@@ -1714,7 +1768,8 @@ def remove_polled_device(
     fd_to_device: dict[int, InputDevice],
     fd: int,
     reason: str,
-) -> None:
+) -> bool:
+    """Remove a failed device and report whether auto-discovery should retry."""
     global open_devices
 
     dev = fd_to_device.pop(fd, None)
@@ -1725,7 +1780,7 @@ def remove_polled_device(
         pass
 
     if dev is None:
-        return
+        return False
 
     # Release only keys owned by this device. Other keyboards may legitimately
     # be holding the same key and must keep their virtual ownership.
@@ -1753,6 +1808,12 @@ def remove_polled_device(
         dev.close()
     except Exception:
         pass
+
+    # An inotify notification and a device POLLHUP can arrive in the same poll
+    # batch. If the notification is handled first, discovery still sees this
+    # device in fd_to_device and skips it. Tell the main loop to rescan again
+    # after the failed descriptor has been removed.
+    return True
 
 
 # -----------------------------------------------------------------------------
@@ -1835,17 +1896,17 @@ def main(argv: list[str] | None = None) -> int:
     logger = setup_logging(log_level)
     logger.info("using config: %s", config_path)
 
-    device_selection, substitutions, sequences, xkb_config = load_config(config_path)
+    device_selection, substitutions, expansions, xkb_config = load_config(config_path)
 
     if args.dump_config:
-        dump_loaded_config(config_path, device_selection, substitutions, sequences, xkb_config)
+        dump_loaded_config(config_path, device_selection, substitutions, expansions, xkb_config)
         return 0
 
     xkb_decoder = XKBDecoder(xkb_config)
     logger.info("xkb layout info: %s", xkb_decoder.layout_info)
     logger.info("watching devices: %s", device_selection)
     logger.info("watching substitutions: %s", [item["combo_text"] for item in substitutions.values()])
-    logger.info("watching sequences: %s", list(sequences.keys()))
+    logger.info("watching expansions: %s", list(expansions.keys()))
 
     auto_discovery_enabled = device_selection == AUTO_DEVICES_MODE
     device_paths = resolve_device_paths(device_selection)
@@ -1874,6 +1935,7 @@ def main(argv: list[str] | None = None) -> int:
 
     poller, fd_to_device = build_poller(open_devices)
     last_auto_rescan = time.monotonic()
+    last_stuck_key_reconcile = time.monotonic()
     input_dir_inotify_fd = setup_input_dir_inotify() if auto_discovery_enabled else None
     pending_auto_rescan = False
     if input_dir_inotify_fd is not None:
@@ -1915,7 +1977,13 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             if mask & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
-                remove_polled_device(poller, fd_to_device, fd, f"invalid poll mask={mask}")
+                if remove_polled_device(
+                    poller,
+                    fd_to_device,
+                    fd,
+                    f"invalid poll mask={mask}",
+                ):
+                    pending_auto_rescan = auto_discovery_enabled
                 continue
 
             if not (mask & select.POLLIN):
@@ -1933,26 +2001,40 @@ def main(argv: list[str] | None = None) -> int:
                         # make typing feel delayed on busy devices.
                         continue
 
-                    handle_key_event(event, dev.path, dev.name, substitutions, sequences)
+                    handle_key_event(event, dev.path, dev.name, substitutions, expansions)
 
             except BlockingIOError:
                 continue
             except OSError as exc:
-                remove_polled_device(
+                if remove_polled_device(
                     poller,
                     fd_to_device,
                     fd,
                     f"device read failed: {exc}",
-                )
+                ):
+                    pending_auto_rescan = auto_discovery_enabled
 
         if auto_discovery_enabled:
             if pending_auto_rescan:
                 add_auto_discovered_devices(poller, fd_to_device)
                 pending_auto_rescan = False
                 last_auto_rescan = time.monotonic()
-            elif input_dir_inotify_fd is None and time.monotonic() - last_auto_rescan >= AUTO_RESCAN_INTERVAL_SEC:
+            elif time.monotonic() - last_auto_rescan >= AUTO_RESCAN_INTERVAL_SEC:
                 add_auto_discovered_devices(poller, fd_to_device)
                 last_auto_rescan = time.monotonic()
+
+        if time.monotonic() - last_stuck_key_reconcile >= STUCK_KEY_RECONCILE_INTERVAL_SEC:
+            for dev in list(fd_to_device.values()):
+                try:
+                    reconcile_stuck_device_keys(dev)
+                except OSError as exc:
+                    logger.warning(
+                        "failed to query active keys path=%s name=%s: %s",
+                        dev.path,
+                        dev.name,
+                        exc,
+                    )
+            last_stuck_key_reconcile = time.monotonic()
 
         if not fd_to_device:
             if auto_discovery_enabled:
@@ -1966,8 +2048,8 @@ def main(argv: list[str] | None = None) -> int:
             logger.error("no input devices remain in poll set; exiting")
             break
 
-        if should_run_queued_sequence_now():
-            run_queued_sequence_if_any()
+        if should_run_queued_expansion_now():
+            run_queued_expansion_if_any()
 
         release_stale_virtual_keys_if_idle()
 

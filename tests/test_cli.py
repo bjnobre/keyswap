@@ -24,7 +24,7 @@ class CliTests(unittest.TestCase):
         self.config = {
             "devices": "auto",
             "substitutions": {"C-nk_minus": "="},
-            "sequences": {":sig": "Kind regards"},
+            "expansions": {":sig": "Kind regards"},
             "xkb": {"layout": "br"},
         }
         self.write_config()
@@ -77,15 +77,15 @@ class CliTests(unittest.TestCase):
             ".",
         )
 
-    def test_add_expansion_writes_existing_sequences_format(self):
+    def test_add_expansion_writes_expansions_format(self):
         result, _stdout, _stderr = self.run_cli(
             "add", "expansion", ":phone", "1234"
         )
 
         self.assertEqual(result, 0)
         config = self.read_config()
-        self.assertEqual(config["sequences"][":phone"], "1234")
-        self.assertNotIn("expansions", config)
+        self.assertEqual(config["expansions"][":phone"], "1234")
+        self.assertNotIn("sequences", config)
 
     def test_add_refuses_duplicate_without_force(self):
         before = self.config_path.read_text(encoding="utf-8")
@@ -126,7 +126,16 @@ class CliTests(unittest.TestCase):
         )
 
         self.assertEqual(result, 0)
-        self.assertNotIn(":sig", self.read_config()["sequences"])
+        self.assertNotIn(":sig", self.read_config()["expansions"])
+
+    def test_legacy_sequences_key_is_rejected(self):
+        self.config["sequences"] = self.config.pop("expansions")
+        self.write_config()
+
+        result, _stdout, stderr = self.run_cli("test")
+
+        self.assertEqual(result, 2)
+        self.assertIn("unsupported config key 'sequences'", stderr)
 
     def test_delete_reports_missing_mapping_without_modifying_config(self):
         before = self.config_path.read_text(encoding="utf-8")

@@ -1,3 +1,11 @@
+keyswap (0.1.0-3) unstable; urgency=medium
+
+  * Rename the text-expansion config key from sequences to expansions.
+  * Reject the removed sequences config key.
+  * Use expansion terminology throughout the runtime and documentation.
+
+ -- Bene <bene@bjnobre.com>  Mon, 27 Jul 2026 00:00:00 -0400
+
 keyswap (0.1.0-2) unstable; urgency=medium
 
   * Add commands to list, add, and delete substitutions and expansions.

@@ -105,7 +105,7 @@ write_config() {
     "C-nk_delete": ".",
     "A-C-S-g": "great!!!"
   },
-  "sequences": {
+  "expansions": {
     ":123": "1234567890"
   },
   "xkb": {

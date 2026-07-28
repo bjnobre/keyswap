@@ -2,7 +2,7 @@
 
 `keyswap` is a Linux keyboard substitution and text-expansion daemon built on top of `evdev`, `uinput`, and `xkbcommon`.
 
-It listens to one or more input devices, forwards normal key events through a virtual keyboard, detects configured key combinations or typed sequences, and injects replacement text system-wide.
+It listens to one or more input devices, forwards normal key events through a virtual keyboard, detects configured key combinations or text-expansion triggers, and injects replacement text system-wide.
 
 The current runtime model is intentionally simple:
 
@@ -27,7 +27,7 @@ What currently works:
 
 - multiple configured input devices
 - combo-to-text substitutions
-- typed sequence expansions
+- typed text expansions
 - XKB-based typed character decoding
 - user config overriding fallback config
 - user-service runtime model
@@ -43,7 +43,7 @@ What is still rough:
 - auto-discovery depends on kernel/udev keyboard metadata and intentionally excludes known pseudo-keyboard devices
 - fallback re-discovery is slower if `/dev/input` notifications are unavailable
 - output character support is still limited to the built-in `CHARMAP`
-- sequence expansion is still timing-sensitive under some fast typing patterns
+- text expansion is still timing-sensitive under some fast typing patterns
 - devices are accepted from config without strong keyboard-capability validation yet
 - no formal release process yet
 
@@ -104,10 +104,10 @@ keyswap delete substitution C-nk_minus
 keyswap delete expansion :phone
 ```
 
-The CLI calls typed sequences “expansions”; the JSON configuration continues
-to store them under `"sequences"` for compatibility. Changes are validated
-before the original file is atomically replaced. Existing mappings are not
-overwritten unless `--force` is passed.
+The CLI and JSON configuration both call typed replacements “expansions” and
+store them under `"expansions"`. Changes are validated before the original file
+is atomically replaced. Existing mappings are not overwritten unless `--force`
+is passed. The legacy `"sequences"` key is not accepted.
 
 Validate configuration without opening input devices or starting the daemon:
 
