@@ -253,60 +253,6 @@ class DeviceReconnectTests(unittest.TestCase):
         self.assertEqual(fd_to_device, {})
 
 
-class StuckKeyReconciliationTests(unittest.TestCase):
-    def setUp(self):
-        keyswap.logger = logging.getLogger("keyswap-stuck-key-test")
-        keyswap.xkb_decoder = None
-        keyswap.virtual_uinput = FakeUInput()
-        keyswap.device_states.clear()
-        keyswap.virtual_key_owners.clear()
-        keyswap.virtual_pressed_keys.clear()
-        keyswap.bug_trace.clear()
-
-    def test_lost_keyup_is_released_when_kernel_reports_key_not_active(self):
-        path = "/dev/input/event21"
-        code = ecodes.KEY_LEFTMETA
-        state = keyswap.DeviceKeyState()
-        state.pressed.add(code)
-        state.forwarded_modifiers.add(code)
-        keyswap.device_states[path] = state
-        keyswap.virtual_key_owners[code] = {path}
-        keyswap.virtual_pressed_keys.add(code)
-        device = SimpleNamespace(
-            path=path,
-            name="Logi K250",
-            active_keys=lambda: [],
-        )
-
-        reconciled = keyswap.reconcile_stuck_device_keys(device)
-
-        self.assertEqual(reconciled, {code})
-        self.assertNotIn(code, state.pressed)
-        self.assertNotIn(code, keyswap.virtual_key_owners)
-        self.assertNotIn(code, keyswap.virtual_pressed_keys)
-        self.assertIn((ecodes.EV_KEY, code, 0), keyswap.virtual_uinput.events)
-
-    def test_intentionally_held_key_is_not_released(self):
-        path = "/dev/input/event21"
-        code = ecodes.KEY_LEFTSHIFT
-        state = keyswap.DeviceKeyState()
-        state.pressed.add(code)
-        keyswap.device_states[path] = state
-        keyswap.virtual_key_owners[code] = {path}
-        keyswap.virtual_pressed_keys.add(code)
-        device = SimpleNamespace(
-            path=path,
-            name="Logi K250",
-            active_keys=lambda: [code],
-        )
-
-        reconciled = keyswap.reconcile_stuck_device_keys(device)
-
-        self.assertEqual(reconciled, set())
-        self.assertIn(code, state.pressed)
-        self.assertEqual(keyswap.virtual_uinput.events, [])
-
-
 class BugTracePrivacyTests(unittest.TestCase):
     def test_text_keys_are_redacted_but_navigation_keys_are_named(self):
         self.assertEqual(keyswap.diagnostic_key_name(ecodes.KEY_A), "<text-key>")

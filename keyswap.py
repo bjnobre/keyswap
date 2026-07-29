@@ -50,7 +50,6 @@ INPUT_EVENT_GLOB = "/dev/input/event*"
 AUTO_DEVICES_MODE = "auto"
 AUTO_RESCAN_INTERVAL_SEC = 60.0
 AUTO_POLL_TIMEOUT_MS = 500
-STUCK_KEY_RECONCILE_INTERVAL_SEC = 1.0
 INPUT_DIR = Path("/dev/input")
 
 # Linux inotify constants. Used to avoid rescanning /dev/input on a timer.
@@ -946,55 +945,6 @@ def release_device_keys(device_id: str, reason: str) -> None:
             [key_name(code) for code in released],
             sorted(device_states),
         )
-
-
-def reconcile_stuck_device_keys(dev: InputDevice) -> set[int]:
-    """Release tracked keys the kernel no longer reports as physically down."""
-    device_id = dev.path
-    state = device_states.get(device_id)
-    if state is None or not state.pressed:
-        return set()
-
-    active_keys = set(dev.active_keys())
-    missing_keyups = state.pressed - active_keys
-    if not missing_keyups:
-        return set()
-
-    dump_bug_context(
-        "lost_keyup_reconciled",
-        device=device_id,
-        keys=[key_name(code) for code in sorted(missing_keyups)],
-    )
-
-    emitted_keyup = False
-    for code in missing_keyups:
-        state.pressed.discard(code)
-        state.forwarded_modifiers.discard(code)
-        state.suppressed_keyups.discard(code)
-        state.triggered_combo_keys.discard(code)
-        state.reported_orphan_repeats.discard(code)
-
-        owners = virtual_key_owners.get(code)
-        if not owners or device_id not in owners:
-            continue
-        owners.discard(device_id)
-        if owners:
-            continue
-        virtual_key_owners.pop(code, None)
-        write_key(code, 0, "lost_keyup_reconcile")
-        emitted_keyup = True
-
-    if emitted_keyup:
-        sync("lost_keyup_reconcile")
-
-    reset_transient_text_state("lost_keyup_reconcile")
-    logger.warning(
-        "reconciled lost key-up events device=%s name=%s keys=%s",
-        device_id,
-        dev.name,
-        [key_name(code) for code in sorted(missing_keyups)],
-    )
-    return missing_keyups
 
 
 def release_all_virtual_keys(reason: str) -> None:
@@ -1935,7 +1885,6 @@ def main(argv: list[str] | None = None) -> int:
 
     poller, fd_to_device = build_poller(open_devices)
     last_auto_rescan = time.monotonic()
-    last_stuck_key_reconcile = time.monotonic()
     input_dir_inotify_fd = setup_input_dir_inotify() if auto_discovery_enabled else None
     pending_auto_rescan = False
     if input_dir_inotify_fd is not None:
@@ -2022,19 +1971,6 @@ def main(argv: list[str] | None = None) -> int:
             elif time.monotonic() - last_auto_rescan >= AUTO_RESCAN_INTERVAL_SEC:
                 add_auto_discovered_devices(poller, fd_to_device)
                 last_auto_rescan = time.monotonic()
-
-        if time.monotonic() - last_stuck_key_reconcile >= STUCK_KEY_RECONCILE_INTERVAL_SEC:
-            for dev in list(fd_to_device.values()):
-                try:
-                    reconcile_stuck_device_keys(dev)
-                except OSError as exc:
-                    logger.warning(
-                        "failed to query active keys path=%s name=%s: %s",
-                        dev.path,
-                        dev.name,
-                        exc,
-                    )
-            last_stuck_key_reconcile = time.monotonic()
 
         if not fd_to_device:
             if auto_discovery_enabled:
