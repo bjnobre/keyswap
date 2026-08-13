@@ -204,7 +204,7 @@ class MultiDeviceOwnershipTests(unittest.TestCase):
 
 
 class VirtualDeviceCapabilityTests(unittest.TestCase):
-    def test_virtual_device_preserves_physical_repeat_capability(self):
+    def test_virtual_device_does_not_enable_second_repeat_source(self):
         physical_device = SimpleNamespace(
             capabilities=lambda: {
                 ecodes.EV_SYN: [ecodes.SYN_REPORT],
@@ -218,8 +218,13 @@ class VirtualDeviceCapabilityTests(unittest.TestCase):
 
         capabilities = uinput.call_args.kwargs["events"]
         self.assertNotIn(ecodes.EV_SYN, capabilities)
-        self.assertIn(ecodes.EV_REP, capabilities)
+        self.assertNotIn(ecodes.EV_REP, capabilities)
         self.assertIn(ecodes.KEY_A, capabilities[ecodes.EV_KEY])
+
+    def test_ydotool_virtual_device_is_excluded_from_auto_discovery(self):
+        virtual_device = SimpleNamespace(name="ydotoold virtual device")
+
+        self.assertFalse(keyswap.should_auto_include_device(virtual_device))
 
 
 class DeviceReconnectTests(unittest.TestCase):
@@ -251,6 +256,41 @@ class DeviceReconnectTests(unittest.TestCase):
 
         self.assertTrue(should_rescan)
         self.assertEqual(fd_to_device, {})
+
+
+class DroppedEventRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        keyswap.logger = logging.getLogger("keyswap-syn-dropped-test")
+        keyswap.xkb_decoder = None
+        keyswap.virtual_uinput = FakeUInput()
+        keyswap.device_states.clear()
+        keyswap.virtual_key_owners.clear()
+        keyswap.virtual_pressed_keys.clear()
+        keyswap.bug_trace.clear()
+
+    def test_resync_releases_stale_key_and_rebuilds_active_keys(self):
+        path = "/dev/input/event0"
+        stale_code = ecodes.KEY_F
+        active_code = ecodes.KEY_LEFTSHIFT
+        state = keyswap.DeviceKeyState()
+        state.pressed.add(stale_code)
+        keyswap.device_states[path] = state
+        keyswap.virtual_key_owners[stale_code] = {path}
+        keyswap.virtual_pressed_keys.add(stale_code)
+        device = SimpleNamespace(
+            path=path,
+            name="AT Translated Set 2 keyboard",
+            active_keys=lambda: [active_code],
+        )
+
+        active_keys = keyswap.resync_device_keys(device, "syn_dropped")
+
+        self.assertEqual(active_keys, {active_code})
+        self.assertEqual(keyswap.device_states[path].pressed, {active_code})
+        self.assertNotIn(stale_code, keyswap.virtual_key_owners)
+        self.assertEqual(keyswap.virtual_key_owners[active_code], {path})
+        self.assertIn((ecodes.EV_KEY, stale_code, 0), keyswap.virtual_uinput.events)
+        self.assertIn((ecodes.EV_KEY, active_code, 1), keyswap.virtual_uinput.events)
 
 
 class BugTracePrivacyTests(unittest.TestCase):

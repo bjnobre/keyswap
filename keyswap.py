@@ -74,6 +74,7 @@ REAL_KEYBOARD_PROBE_KEYS = {
 KEYSWAP_UINPUT_NAME = "keyswap-uinput"
 PSEUDO_KEYBOARD_NAMES = {
     KEYSWAP_UINPUT_NAME,
+    "ydotoold virtual device",
     "Power Button",
     "Sleep Button",
     "Video Bus",
@@ -947,6 +948,40 @@ def release_device_keys(device_id: str, reason: str) -> None:
         )
 
 
+def resync_device_keys(dev: InputDevice, reason: str) -> set[int]:
+    """Rebuild one device after the kernel reports an evdev buffer overrun."""
+    device_id = dev.path
+    release_device_keys(device_id, reason)
+
+    active_keys = set(dev.active_keys())
+    state = device_states.setdefault(device_id, DeviceKeyState())
+    emitted_keydown = False
+
+    for code in sorted(active_keys):
+        state.pressed.add(code)
+        if code in ALL_MODIFIER_KEYS:
+            state.forwarded_modifiers.add(code)
+
+        owners = virtual_key_owners.setdefault(code, set())
+        first_owner = not owners
+        owners.add(device_id)
+        if first_owner:
+            write_key(code, 1, f"device_resync({reason})")
+            emitted_keydown = True
+
+    if emitted_keydown:
+        sync(f"device_resync({reason})")
+
+    reset_transient_text_state(reason)
+    logger.warning(
+        "resynchronized device after dropped input events path=%s name=%s active_keys=%s",
+        device_id,
+        dev.name,
+        [key_name(code) for code in sorted(active_keys)],
+    )
+    return active_keys
+
+
 def release_all_virtual_keys(reason: str) -> None:
     if virtual_uinput is None:
         return
@@ -1280,7 +1315,10 @@ def create_virtual_uinput(devices: list[InputDevice]) -> UInput:
 
     for dev in devices:
         for event_type, event_codes in dev.capabilities().items():
-            if event_type in (ecodes.EV_SYN, ecodes.EV_FF):
+            # Physical repeat packets are forwarded explicitly. Advertising
+            # EV_REP here also enables a repeat timer on the virtual keyboard,
+            # creating a second source that can outlive a delayed key-up.
+            if event_type in (ecodes.EV_SYN, ecodes.EV_FF, ecodes.EV_REP):
                 continue
             capabilities.setdefault(event_type, set()).update(event_codes)
 
@@ -1887,6 +1925,7 @@ def main(argv: list[str] | None = None) -> int:
     last_auto_rescan = time.monotonic()
     input_dir_inotify_fd = setup_input_dir_inotify() if auto_discovery_enabled else None
     pending_auto_rescan = False
+    desynchronized_fds: set[int] = set()
     if input_dir_inotify_fd is not None:
         poller.register(input_dir_inotify_fd, select.POLLIN)
 
@@ -1926,6 +1965,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             if mask & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                desynchronized_fds.discard(fd)
                 if remove_polled_device(
                     poller,
                     fd_to_device,
@@ -1944,10 +1984,25 @@ def main(argv: list[str] | None = None) -> int:
 
             try:
                 for event in dev.read():
+                    if event.type == ecodes.EV_SYN:
+                        if event.code == ecodes.SYN_DROPPED:
+                            desynchronized_fds.add(fd)
+                            logger.warning(
+                                "kernel dropped input events path=%s name=%s; waiting for SYN_REPORT",
+                                dev.path,
+                                dev.name,
+                            )
+                        elif event.code == ecodes.SYN_REPORT and fd in desynchronized_fds:
+                            resync_device_keys(dev, "syn_dropped")
+                            desynchronized_fds.discard(fd)
+                        continue
+
+                    if fd in desynchronized_fds:
+                        continue
+
                     if event.type != ecodes.EV_KEY:
-                        # Keyswap only remaps keyboard keys. Forwarding EV_SYN/MSC
-                        # from grabbed physical devices adds needless work and can
-                        # make typing feel delayed on busy devices.
+                        # Keyswap only remaps keyboard keys. Forwarding MSC and
+                        # other metadata adds needless work on busy devices.
                         continue
 
                     handle_key_event(event, dev.path, dev.name, substitutions, expansions)
@@ -1955,6 +2010,7 @@ def main(argv: list[str] | None = None) -> int:
             except BlockingIOError:
                 continue
             except OSError as exc:
+                desynchronized_fds.discard(fd)
                 if remove_polled_device(
                     poller,
                     fd_to_device,
@@ -1968,7 +2024,10 @@ def main(argv: list[str] | None = None) -> int:
                 add_auto_discovered_devices(poller, fd_to_device)
                 pending_auto_rescan = False
                 last_auto_rescan = time.monotonic()
-            elif time.monotonic() - last_auto_rescan >= AUTO_RESCAN_INTERVAL_SEC:
+            elif (
+                input_dir_inotify_fd is None
+                and time.monotonic() - last_auto_rescan >= AUTO_RESCAN_INTERVAL_SEC
+            ):
                 add_auto_discovered_devices(poller, fd_to_device)
                 last_auto_rescan = time.monotonic()
 
