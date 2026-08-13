@@ -1,3 +1,12 @@
+keyswap (0.1.0-4) unstable; urgency=medium
+
+  * Recover per-device key state after evdev reports dropped events.
+  * Prevent the virtual keyboard from creating a second repeat source.
+  * Exclude ydotool's virtual device from automatic keyboard discovery.
+  * Limit periodic discovery scans to systems without inotify support.
+
+ -- Bene <bene@bjnobre.com>  Thu, 13 Aug 2026 00:00:00 -0400
+
 keyswap (0.1.0-3) unstable; urgency=medium
 
   * Rename the text-expansion config key from sequences to expansions.
