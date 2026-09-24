@@ -227,6 +227,75 @@ class VirtualDeviceCapabilityTests(unittest.TestCase):
         self.assertFalse(keyswap.should_auto_include_device(virtual_device))
 
 
+class VirtualOutputMonitorTests(unittest.TestCase):
+    def test_virtual_write_failure_keeps_incident_and_requests_service_restart(self):
+        failing_output = SimpleNamespace(write=lambda *_args: (_ for _ in ()).throw(OSError("device gone")))
+        original_output = keyswap.virtual_uinput
+        original_monitor = keyswap.virtual_output_monitor
+        original_logger = keyswap.logger
+        keyswap.virtual_uinput = failing_output
+        keyswap.virtual_output_monitor = None
+        keyswap.logger = logging.getLogger("keyswap-output-monitor-test")
+        try:
+            with patch.object(keyswap, "dump_bug_context") as incident:
+                with self.assertRaises(keyswap.VirtualOutputError):
+                    keyswap.send_key(ecodes.KEY_ESC, 1, "test")
+        finally:
+            keyswap.virtual_uinput = original_output
+            keyswap.virtual_output_monitor = original_monitor
+            keyswap.logger = original_logger
+
+        incident.assert_called_once()
+        self.assertEqual(incident.call_args.args, ("virtual_output_write_failed",))
+
+    def test_detects_compositor_fd_loss_while_kernel_echo_continues(self):
+        reader = SimpleNamespace(
+            path="/dev/input/event22",
+            fd=10,
+            read=lambda: iter([SimpleNamespace(type=ecodes.EV_KEY, code=ecodes.KEY_ESC)]),
+        )
+        output = SimpleNamespace(device=reader)
+        original_logger = keyswap.logger
+        keyswap.logger = logging.getLogger("keyswap-output-monitor-test")
+        try:
+            with (
+                patch.object(keyswap.os, "fstat", return_value=SimpleNamespace(st_rdev=13)),
+                patch.object(keyswap.os, "stat", return_value=SimpleNamespace(st_rdev=13)),
+                patch.object(keyswap, "compositor_fds_for_device", side_effect=[{123: 1}, {123: 0}]),
+                patch.object(keyswap, "dump_bug_context") as incident,
+            ):
+                monitor = keyswap.VirtualOutputMonitor(output)
+                monitor.check("startup")
+                monitor.check("periodic")
+        finally:
+            keyswap.logger = original_logger
+
+        self.assertEqual(monitor.echoed_keys, 2)
+        incident.assert_called_once()
+        self.assertEqual(incident.call_args.args, ("virtual_output_changed",))
+        self.assertEqual(incident.call_args.kwargs["compositor_fds"], {123: 0})
+
+    def test_detects_removed_virtual_evdev_node(self):
+        reader = SimpleNamespace(path="/dev/input/event22", fd=10, read=lambda: iter(()))
+        original_logger = keyswap.logger
+        keyswap.logger = logging.getLogger("keyswap-output-monitor-test")
+        try:
+            with (
+                patch.object(keyswap.os, "fstat", return_value=SimpleNamespace(st_rdev=13)),
+                patch.object(keyswap.os, "stat", side_effect=[SimpleNamespace(st_rdev=13), FileNotFoundError()]),
+                patch.object(keyswap, "compositor_fds_for_device", return_value={}),
+                patch.object(keyswap, "dump_bug_context") as incident,
+            ):
+                monitor = keyswap.VirtualOutputMonitor(SimpleNamespace(device=reader))
+                monitor.check("startup")
+                monitor.check("periodic")
+        finally:
+            keyswap.logger = original_logger
+
+        incident.assert_called_once()
+        self.assertIsNone(incident.call_args.kwargs["health"][2])
+
+
 class DeviceReconnectTests(unittest.TestCase):
     def test_removing_polled_device_requests_post_removal_rescan(self):
         device = SimpleNamespace(

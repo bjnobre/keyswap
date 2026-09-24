@@ -162,6 +162,16 @@ visible. To retrieve captured incidents:
 journalctl --user -u keyswap.service -g BUG_CONTEXT
 ```
 
+The service also records `virtual output health` at startup, after a long
+poll gap (such as resume), and when a keyboard is added or removed. It checks
+whether the virtual `/dev/input/event*` node is still the same device, counts
+key events written to uinput and independently echoed by the kernel, and
+counts open descriptors held by niri or sway. A lost virtual node or compositor
+descriptor creates a `BUG_CONTEXT` incident. A failed uinput write also
+records an incident and lets systemd restart the service. The descriptor count
+shows whether a compositor has the device open; it cannot prove that the
+compositor is processing the events.
+
 ---
 
 ## License
