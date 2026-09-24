@@ -51,6 +51,7 @@ AUTO_DEVICES_MODE = "auto"
 AUTO_RESCAN_INTERVAL_SEC = 60.0
 AUTO_POLL_TIMEOUT_MS = 500
 INPUT_DIR = Path("/dev/input")
+VIRTUAL_HEALTH_INTERVAL_SEC = 5.0
 
 # Linux inotify constants. Used to avoid rescanning /dev/input on a timer.
 IN_CREATE = 0x00000100
@@ -324,8 +325,13 @@ pending_expansion_run: dict[str, Any] | None = None
 
 open_devices: list[InputDevice] = []
 virtual_uinput: UInput | None = None
+virtual_output_monitor: "VirtualOutputMonitor | None" = None
 logger: logging.Logger | None = None
 xkb_decoder: "XKBDecoder | None" = None
+
+
+class VirtualOutputError(RuntimeError):
+    """A write to the virtual keyboard failed; the service must restart."""
 
 
 # -----------------------------------------------------------------------------
@@ -1158,7 +1164,13 @@ def send_key(code: int, value: int, reason: str) -> None:
         [key_name(item) for item in sorted(all_pressed_physical_keys())],
     )
 
-    virtual_uinput.write(ecodes.EV_KEY, code, value)
+    try:
+        virtual_uinput.write(ecodes.EV_KEY, code, value)
+        if virtual_output_monitor is not None:
+            virtual_output_monitor.written_keys += 1
+    except OSError as exc:
+        dump_bug_context("virtual_output_write_failed", error=str(exc))
+        raise VirtualOutputError(f"virtual keyboard write failed: {exc}") from exc
 
 
 def write_key(code: int, value: int, reason: str) -> None:
@@ -1305,8 +1317,14 @@ def forward_event(event, reason: str, device_name: str) -> None:
             state_snapshot(),
         )
 
-    virtual_uinput.write_event(event)
-    virtual_uinput.syn()
+    try:
+        virtual_uinput.write_event(event)
+        if event.type == ecodes.EV_KEY and virtual_output_monitor is not None:
+            virtual_output_monitor.written_keys += 1
+        virtual_uinput.syn()
+    except OSError as exc:
+        dump_bug_context("virtual_output_write_failed", error=str(exc))
+        raise VirtualOutputError(f"virtual keyboard write failed: {exc}") from exc
 
 
 def create_virtual_uinput(devices: list[InputDevice]) -> UInput:
@@ -1324,6 +1342,100 @@ def create_virtual_uinput(devices: list[InputDevice]) -> UInput:
 
     capabilities.setdefault(ecodes.EV_KEY, set()).update(NAVIGATION_KEYCODES)
     return UInput(events=capabilities, name=KEYSWAP_UINPUT_NAME)
+
+
+def compositor_fds_for_device(device_number: int) -> dict[int, int]:
+    """Count niri/sway descriptors pointing to this evdev device.
+
+    This is only evidence that a compositor has the device open. It cannot
+    prove that the compositor is reading or handling its events.
+    """
+    clients: dict[int, int] = {}
+    try:
+        processes = list(Path("/proc").iterdir())
+    except OSError:
+        return clients
+    for process in processes:
+        if not process.name.isdigit():
+            continue
+        try:
+            if (process / "comm").read_text().strip() not in {"niri", "sway"}:
+                continue
+            count = 0
+            for fd in (process / "fd").iterdir():
+                try:
+                    if os.stat(fd).st_rdev == device_number:
+                        count += 1
+                except (OSError, ValueError):
+                    continue
+            clients[int(process.name)] = count
+        except (OSError, ValueError):
+            continue
+    return clients
+
+
+class VirtualOutputMonitor:
+    """Observe the virtual evdev node and its independent kernel echo stream."""
+
+    def __init__(self, output: UInput):
+        self.reader = output.device
+        self.path = self.reader.path if self.reader is not None else None
+        try:
+            self.device_number = os.fstat(self.reader.fd).st_rdev if self.reader is not None else None
+        except OSError:
+            self.device_number = None
+            self.reader = None
+        self.written_keys = 0
+        self.echoed_keys = 0
+        self.last_health: tuple[Any, ...] | None = None
+        self.last_clients: dict[int, int] | None = None
+
+    def drain(self) -> None:
+        if self.reader is None:
+            return
+        try:
+            for event in self.reader.read():
+                if event.type == ecodes.EV_KEY:
+                    self.echoed_keys += 1
+                elif event.type == ecodes.EV_SYN and event.code == ecodes.SYN_DROPPED:
+                    logger.warning("virtual evdev monitor lost events path=%s", self.path)
+        except BlockingIOError:
+            pass
+        except OSError as exc:
+            logger.warning("virtual evdev monitor read failed path=%s error=%s", self.path, exc)
+            self.reader = None
+
+    def check(self, reason: str, *, report: bool = False) -> None:
+        self.drain()
+        try:
+            current_number = os.stat(self.path).st_rdev if self.path else None
+        except OSError:
+            current_number = None
+        health = (self.path, self.device_number, current_number, self.reader is not None)
+        clients = compositor_fds_for_device(self.device_number) if self.device_number is not None else {}
+        changed = self.last_health is not None and health != self.last_health
+        gained_compositor_fd = (
+            self.last_clients is not None
+            and not any(count > 0 for count in self.last_clients.values())
+            and any(count > 0 for count in clients.values())
+        )
+        lost_compositor_fd = (
+            self.last_clients is not None
+            and any(count > 0 for count in self.last_clients.values())
+            and not any(count > 0 for count in clients.values())
+        )
+        if report or changed or gained_compositor_fd or lost_compositor_fd:
+            log = logger.warning
+            log(
+                "virtual output health reason=%s path=%s expected_rdev=%s current_rdev=%s "
+                "reader_open=%s written_keys=%s echoed_keys=%s compositor_fds=%s",
+                reason, self.path, self.device_number, current_number,
+                self.reader is not None, self.written_keys, self.echoed_keys, clients,
+            )
+        if changed or lost_compositor_fd:
+            dump_bug_context("virtual_output_changed", trigger=reason, health=health, compositor_fds=clients)
+        self.last_health = health
+        self.last_clients = clients
 
 
 # -----------------------------------------------------------------------------
@@ -1745,6 +1857,8 @@ def add_auto_discovered_devices(
             open_devices.append(dev)
             active_paths.add(path)
             logger.info("auto-added keyboard path=%s name=%s", dev.path, dev.name)
+            if virtual_output_monitor is not None:
+                virtual_output_monitor.check("keyboard_added", report=True)
         except PermissionError:
             logger.warning("auto-discovered keyboard is not accessible: %s", path)
         except OSError as exc:
@@ -1786,6 +1900,8 @@ def remove_polled_device(
         getattr(dev, "name", "?"),
         reason,
     )
+    if virtual_output_monitor is not None:
+        virtual_output_monitor.check("keyboard_removed", report=True)
 
     try:
         dev.ungrab()
@@ -1809,7 +1925,7 @@ def remove_polled_device(
 # -----------------------------------------------------------------------------
 
 def cleanup_and_exit(*_args) -> None:
-    global open_devices, virtual_uinput, xkb_decoder
+    global open_devices, virtual_uinput, virtual_output_monitor, xkb_decoder
 
     if logger is not None:
         logger.info("stopping")
@@ -1847,7 +1963,7 @@ def cleanup_and_exit(*_args) -> None:
 # -----------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
-    global open_devices, virtual_uinput, logger, xkb_decoder, last_poll_wakeup_time
+    global open_devices, virtual_uinput, virtual_output_monitor, logger, xkb_decoder, last_poll_wakeup_time
 
     args = parse_args(argv)
     config_path = resolve_config_path(args.config)
@@ -1912,6 +2028,8 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     virtual_uinput = create_virtual_uinput(devices)
+    virtual_output_monitor = VirtualOutputMonitor(virtual_uinput)
+    virtual_output_monitor.check("startup", report=True)
     release_all_virtual_keys("startup")
 
     signal.signal(signal.SIGINT, cleanup_and_exit)
@@ -1923,6 +2041,7 @@ def main(argv: list[str] | None = None) -> int:
 
     poller, fd_to_device = build_poller(open_devices)
     last_auto_rescan = time.monotonic()
+    last_virtual_health_check = time.monotonic()
     input_dir_inotify_fd = setup_input_dir_inotify() if auto_discovery_enabled else None
     pending_auto_rescan = False
     desynchronized_fds: set[int] = set()
@@ -1941,6 +2060,8 @@ def main(argv: list[str] | None = None) -> int:
                 state_snapshot(),
             )
             release_all_virtual_keys("long_poll_gap_possible_resume")
+            virtual_output_monitor.check("poll_gap_possible_resume", report=True)
+            last_virtual_health_check = now
         last_poll_wakeup_time = now
 
         for fd, mask in ready:
@@ -2030,6 +2151,11 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 add_auto_discovered_devices(poller, fd_to_device)
                 last_auto_rescan = time.monotonic()
+
+        virtual_output_monitor.drain()
+        if now - last_virtual_health_check >= VIRTUAL_HEALTH_INTERVAL_SEC:
+            virtual_output_monitor.check("periodic")
+            last_virtual_health_check = now
 
         if not fd_to_device:
             if auto_discovery_enabled:
