@@ -170,7 +170,8 @@ counts open descriptors held by niri or sway. A lost virtual node or compositor
 descriptor creates a `BUG_CONTEXT` incident. A failed uinput write also
 records an incident and lets systemd restart the service. The descriptor count
 shows whether a compositor has the device open; it cannot prove that the
-compositor is processing the events.
+compositor is processing the events. The health checks and kernel echo reader
+run on a separate diagnostic thread so they do not pause key forwarding.
 
 ---
 
