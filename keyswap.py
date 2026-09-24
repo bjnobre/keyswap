@@ -22,10 +22,12 @@ import ctypes
 import json
 import logging
 import os
+import queue
 import select
 import signal
 import sys
 import tempfile
+import threading
 import time
 import subprocess
 from collections import deque
@@ -1389,6 +1391,44 @@ class VirtualOutputMonitor:
         self.echoed_keys = 0
         self.last_health: tuple[Any, ...] | None = None
         self.last_clients: dict[int, int] | None = None
+        self._requests: queue.SimpleQueue[tuple[str, bool]] = queue.SimpleQueue()
+        self._wake = threading.Event()
+        self._stopping = False
+        self._thread = threading.Thread(target=self._run, name="keyswap-output-monitor", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stopping = True
+        self._wake.set()
+        self._thread.join(timeout=1.0)
+
+    def request_check(self, reason: str, *, report: bool = False) -> None:
+        self._requests.put((reason, report))
+        self._wake.set()
+
+    def _run(self) -> None:
+        last_check = time.monotonic()
+        while not self._stopping:
+            self._wake.wait(0.1)
+            self._wake.clear()
+            if self._stopping:
+                break
+            try:
+                self.drain()
+                while True:
+                    try:
+                        reason, report = self._requests.get_nowait()
+                    except queue.Empty:
+                        break
+                    self.check(reason, report=report)
+                    last_check = time.monotonic()
+                if time.monotonic() - last_check >= VIRTUAL_HEALTH_INTERVAL_SEC:
+                    self.check("periodic")
+                    last_check = time.monotonic()
+            except Exception:
+                logger.exception("virtual output monitor failed")
 
     def drain(self) -> None:
         if self.reader is None:
@@ -1858,7 +1898,7 @@ def add_auto_discovered_devices(
             active_paths.add(path)
             logger.info("auto-added keyboard path=%s name=%s", dev.path, dev.name)
             if virtual_output_monitor is not None:
-                virtual_output_monitor.check("keyboard_added", report=True)
+                virtual_output_monitor.request_check("keyboard_added", report=True)
         except PermissionError:
             logger.warning("auto-discovered keyboard is not accessible: %s", path)
         except OSError as exc:
@@ -1901,7 +1941,7 @@ def remove_polled_device(
         reason,
     )
     if virtual_output_monitor is not None:
-        virtual_output_monitor.check("keyboard_removed", report=True)
+        virtual_output_monitor.request_check("keyboard_removed", report=True)
 
     try:
         dev.ungrab()
@@ -1929,6 +1969,9 @@ def cleanup_and_exit(*_args) -> None:
 
     if logger is not None:
         logger.info("stopping")
+
+    if virtual_output_monitor is not None:
+        virtual_output_monitor.stop()
 
     for dev in open_devices:
         try:
@@ -2029,8 +2072,9 @@ def main(argv: list[str] | None = None) -> int:
 
     virtual_uinput = create_virtual_uinput(devices)
     virtual_output_monitor = VirtualOutputMonitor(virtual_uinput)
-    virtual_output_monitor.check("startup", report=True)
+    virtual_output_monitor.start()
     release_all_virtual_keys("startup")
+    virtual_output_monitor.request_check("startup", report=True)
 
     signal.signal(signal.SIGINT, cleanup_and_exit)
     signal.signal(signal.SIGTERM, cleanup_and_exit)
@@ -2041,7 +2085,6 @@ def main(argv: list[str] | None = None) -> int:
 
     poller, fd_to_device = build_poller(open_devices)
     last_auto_rescan = time.monotonic()
-    last_virtual_health_check = time.monotonic()
     input_dir_inotify_fd = setup_input_dir_inotify() if auto_discovery_enabled else None
     pending_auto_rescan = False
     desynchronized_fds: set[int] = set()
@@ -2060,8 +2103,7 @@ def main(argv: list[str] | None = None) -> int:
                 state_snapshot(),
             )
             release_all_virtual_keys("long_poll_gap_possible_resume")
-            virtual_output_monitor.check("poll_gap_possible_resume", report=True)
-            last_virtual_health_check = now
+            virtual_output_monitor.request_check("poll_gap_possible_resume", report=True)
         last_poll_wakeup_time = now
 
         for fd, mask in ready:
@@ -2151,11 +2193,6 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 add_auto_discovered_devices(poller, fd_to_device)
                 last_auto_rescan = time.monotonic()
-
-        virtual_output_monitor.drain()
-        if now - last_virtual_health_check >= VIRTUAL_HEALTH_INTERVAL_SEC:
-            virtual_output_monitor.check("periodic")
-            last_virtual_health_check = now
 
         if not fd_to_device:
             if auto_discovery_enabled:

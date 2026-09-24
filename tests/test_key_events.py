@@ -4,6 +4,7 @@ import json
 import logging
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -228,6 +229,30 @@ class VirtualDeviceCapabilityTests(unittest.TestCase):
 
 
 class VirtualOutputMonitorTests(unittest.TestCase):
+    def test_requested_health_check_runs_outside_input_thread(self):
+        reader = SimpleNamespace(path="/dev/input/event22", fd=10, read=lambda: iter(()))
+        original_logger = keyswap.logger
+        keyswap.logger = logging.getLogger("keyswap-output-monitor-test")
+        completed = threading.Event()
+        caller_thread = threading.get_ident()
+        called_from = []
+        try:
+            with patch.object(keyswap.os, "fstat", return_value=SimpleNamespace(st_rdev=13)):
+                monitor = keyswap.VirtualOutputMonitor(SimpleNamespace(device=reader))
+            def record_check(reason, *, report=False):
+                called_from.append((reason, report, threading.get_ident()))
+                completed.set()
+            with patch.object(monitor, "check", side_effect=record_check):
+                monitor.start()
+                monitor.request_check("keyboard_added", report=True)
+                self.assertTrue(completed.wait(1.0))
+                monitor.stop()
+        finally:
+            keyswap.logger = original_logger
+
+        self.assertEqual(called_from[0][:2], ("keyboard_added", True))
+        self.assertNotEqual(called_from[0][2], caller_thread)
+
     def test_virtual_write_failure_keeps_incident_and_requests_service_restart(self):
         failing_output = SimpleNamespace(write=lambda *_args: (_ for _ in ()).throw(OSError("device gone")))
         original_output = keyswap.virtual_uinput
